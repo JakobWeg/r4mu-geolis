@@ -152,19 +152,16 @@ def home(
     """
     uc_id = "home"
     print("Use case: " + uc_id)
-    if uc_dict["mode"] == "potential":
-        num_home = 1000000
-        energy_sum = 1
+
+    ts_dict = uc_dict["charging_event"]
+    load = ts_dict[uc_dict['key']].loc[:, "sum home"]
+    load_sum = load.sum()
+    energy_sum = load_sum * timestep / 60
+    if len(car_num.index) == 1:
+        car_sum = sum(car_num.at["single_region"].values())
     else:
-        ts_dict = uc_dict["timeseries"]
-        load = ts_dict[uc_dict['key']].loc[:, "sum home"]
-        load_sum = load.sum()
-        energy_sum = load_sum * timestep / 60
-        if len(car_num.index) == 1:
-            car_sum = sum(car_num.at["single_region"].values())
-        else:
-            car_sum = sum(car_num.at[uc_dict['key']].values())
-        num_home = math.ceil(car_sum * home_charge_prob)
+        car_sum = sum(car_num.at[uc_dict['key']].values())
+    num_home = math.ceil(car_sum * home_charge_prob)
 
     if num_home > 0:
         # filter houses by region

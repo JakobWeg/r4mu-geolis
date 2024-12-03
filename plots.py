@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 import pathlib
 
+
 # plot hpc
 def plot_uc(use_case, charge_points, uc_dict):
     fig, ax = plt.subplots()
