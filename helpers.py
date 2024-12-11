@@ -103,7 +103,9 @@ def combine_csv_to_parquet(csv_folder_path, output_file):
         # print(f"Lese Datei: {csv_file}")
         # Lese die CSV-Datei ohne Header (ignoriere den Header)
         temp_df = pd.read_csv(csv_file, header=0)
+        temp_df = temp_df.loc[temp_df["station_charging_capacity"] != 0]
         combined_df = pd.concat([combined_df, temp_df], ignore_index=True)
+
         if idx % 1000 == 0:
             print(f"Iteration {idx} erreicht.")
 
@@ -112,10 +114,58 @@ def combine_csv_to_parquet(csv_folder_path, output_file):
     combined_df.to_parquet(output_file, index=False)
     print("Fertig!")
 
+def convert_geodata_for_uc_work(landusepath, alkispath):
+    print("converting_geodata_for_uc_work")
+    landuse_gdf = gpd.read_file(landusepath)# .to_crs(3035)
+    alkis_gdf = gpd.read_file(alkispath)# .to_crs(3035)
+    landuse_work = landuse_gdf.loc[landuse_gdf['nutzung'].isin(['Gewerbe- und Industrienutzung, großflächiger Einzelhandel', 'Mischnutzung'])]
+    alkis_keys_work = ['Fabrik', 'Lagerhalle, Lagerschuppen, Lagerhaus', b'Geb\xe4ude f\xfcr Gewerbe und Industrie',
+                       'Seniorenheim', b'Land- und forstwirtschaftliches Betriebsgeb\xe4ude', 'Laden',
+                       b'Geb\xe4ude zur Freizeitgestaltung', b'Geb\xe4ude f\xfcr soziale Zwecke', 'Einkaufszentrum',
+                       b'Geb\xe4ude zur Versorgung', b'Freizeit- und Vergn\xfcgungsst\xe4tte',
+                       'Heilanstalt, Pflegeanstalt, Pflegestation', b'Kinderkrippe, Kindergarten, Kindertagesst\xe4tte',
+                       'Hotel, Motel, Pension', 'Rathaus', 'Tankstelle', b'Geb\xe4ude f\xfcr Gesundheitswesen',
+                       'Justizvollzugsanstalt', b'Sonstiges Geb\xe4ude f\xfcr Gewerbe und Industrie',
+                       b'B\xfcrogeb\xe4ude', 'Krankenhaus', b'Betriebsgeb\xe4ude f\xfcr Schienenverkehr', 'Feuerwehr',
+                       'Gemeindehaus', b'Geb\xe4ude f\xfcr Sicherheit und Ordnung',
+                       b'Wohngeb\xe4ude mit Gewerbe und Industrie', b'Geb\xe4ude f\xfcr Handel und Dienstleistungen',
+                       'Kreditinstitut', b'Verwaltungsgeb\xe4ude',
+                       b'Geb\xe4ude f\xfcr Gewerbe und Industrie mit Wohnen', b'Gesch\xe4ftsgeb\xe4ude', 'Messehalle',
+                       b'Geb\xe4ude f\xfcr Bildung und Forschung',
+                       b'Hochschulgeb\xe4ude (Fachhochschule, Universit\xe4t)', 'Botschaft, Konsulat', 'Theater, Oper',
+                       b'Geb\xe4ude f\xfcr Handel und Dienstleistung mit Wohnen', 'Polizei', 'Versicherung',
+                       b'Gemischt genutztes Geb\xe4ude mit Wohnen', 'Kaserne', 'Kaufhaus', 'Forschungsinstitut',
+                       'Berufsbildende Schule', b'Speditionsgeb\xe4ude', b'Geb\xe4ude f\xfcr Forschungszwecke',
+                       'Gericht', b'Stra\xdfenmeisterei', 'Rundfunk, Fernsehen', b'Flughafengeb\xe4ude', 'Zollamt'
+                       ]
+    alkis_work = alkis_gdf.loc[alkis_gdf["bezgfk"].isin(alkis_keys_work)]
+    alkis_work["area"] = alkis_work.area
+    alkis_work['centroid'] = alkis_work.geometry.centroid  # Zentroid berechnen (optional, wenn du die Originalgeometrien behalten willst)
+    alkis_work.set_geometry('centroid', inplace=True)
+    alkis_work = alkis_work.drop(columns=["geometry"])
+
+    landuse_work["area"] = landuse_work.area
+    landuse_work['centroid'] = landuse_work.geometry.centroid  # Zentroid berechnen (optional, wenn du die Originalgeometrien behalten willst)
+    landuse_work.set_geometry('centroid', inplace=True)
+    landuse_work = landuse_work.drop(columns=["geometry"])
+
+    for col in alkis_work.select_dtypes(include='object').columns:
+        alkis_work[col] = alkis_work[col].astype(str)
+
+    alkis_work.to_file("data/work_points_alkis.gpkg", driver='GPKG')
+    landuse_work.to_file("data/work_points_landuse.gpkg", driver='GPKG')
+    print(f"Gefilterte Punkte erfolgreich in data gespeichert.")
+
+def convert_geodata_for_uc_street(landusepath, alkispath):
+    print("converting_geodata_for_uc_street")
+
+
 # Beispielnutzung
 if __name__ == "__main__":
     # charging_events = pd.read_parquet("combined_charging_events.parquet")
     # print(charging_events)
-    combine_csv_to_parquet("//FS01/RedirectedFolders/Jakob.Wegner/Desktop/r4mu_übergabe/2035/default_2024-10-28_141930_simbev_run/SR_Metro", "combined_charging_events.parquet")
+    # combine_csv_to_parquet("//FS01/RedirectedFolders/Jakob.Wegner/Desktop/r4mu_übergabe/2045/scaling_1000_fix_default_2024-12-05_114939_simbev_run/SR_Metro",
+    #                        "scenario/combined_charging_events_2045_1.parquet")
+    convert_geodata_for_uc_work(landusepath="data/Reale_Nutzung_2021_Umweltatlas.gpkg", alkispath="data/ALKIS_Berlin_Gebäude.gpkg")
     # filter_points_within_boundary()
     # merge_geometries_to_polygon()

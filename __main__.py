@@ -32,14 +32,14 @@ def parse_data(args):
 
     # always used parameters
     boundaries = gpd.read_file(pathlib.Path(data_dir, parser.get('data', 'boundaries')))
-    # boundaries.set_index('ags_0', inplace=True)  # region key as dataframe index
-    # boundaries = boundaries.dissolve(by='ags_0')  # merge regions with identical key
+    boundaries = boundaries.to_crs(3035)
 
-    # charge_info_file = parser.get("uc_params", "charging_info")
-    # charge_info = pd.read_csv(pathlib.Path(data_dir, charge_info_file), sep=';', index_col="usecase")
-    # charge_info_dict = charge_info.to_dict(orient="index")
+    # create results dir
+    timestamp_now = datetime.now()
+    timestamp = timestamp_now.strftime("%y-%m-%d_%H%M%S")
+    result_dir = pathlib.Path('results', '_{}'.format(timestamp))
+    result_dir.mkdir(exist_ok=True, parents=True)
 
-    # set random seed from config or truly random if none is given
     rng_seed = parser['basic'].getint('random_seed', None)
     rng = np.random.default_rng(rng_seed)
 
@@ -54,7 +54,9 @@ def parse_data(args):
         # 'charge_info': charge_info_dict,
         'scenario_name': args.scenario,
         'random_seed': rng,
-        'mode': args.mode
+        'mode': args.mode,
+        'charge_events_path': parser.get('data', 'charging_events'),
+        'result_dir': result_dir
     }
 
     if run_hpc:
@@ -101,13 +103,13 @@ def parse_data(args):
     return config_dict
 
 
-def parse_car_data(args):
-    scenario_path = pathlib.Path('scenario')
-    ts_path = pathlib.Path(scenario_path, "charging_events.parquet")
+def parse_car_data(args, data_dict):
+    scenario_path = pathlib.Path(args.scenario, data_dict["charge_events_path"])
+    ts_path = pathlib.Path(scenario_path, )
 
     # charging_events = pd.read_csv(ts_path, sep=",")
     charging_events = pd.read_parquet(ts_path)
-
+    charging_events = charging_events.loc[charging_events["station_charging_capacity"] != 0]
     print ("--- parsing charging events done")
 
     return charging_events
@@ -115,7 +117,7 @@ def parse_car_data(args):
 
 def parse_default_data(args):
     data_dict = parse_data(args)
-    charging_event_data = parse_car_data(args)
+    charging_event_data = parse_car_data(args, data_dict)
     data_dict["charging_event"] = charging_event_data
     return data_dict
 
@@ -139,12 +141,8 @@ def run_use_cases(data_dict):
                   data_dict)
 
     if data_dict['run_home']:
-        if "home_prob" in data_dict.keys():
-            uc.home(data_dict['buildings'],
-                    data_dict, data_dict['home_prob'], data_dict['num_car'])
-        else:
-            uc.home(data_dict['buildings'],
-                    data_dict, 0, 0)
+        uc.home(data_dict['buildings'],
+                data_dict, 0, 0)
 
     if data_dict['run_work']:
         uc.work(data_dict['work'],
@@ -152,42 +150,12 @@ def run_use_cases(data_dict):
                 data_dict)
 
 
-def run_distribution(data_dict):
-    bounds = data_dict['boundaries']
-
-    # create result directory
-    timestamp_now = datetime.now()
-    timestamp = timestamp_now.strftime("%y-%m-%d_%H%M%S")
-    result_dir = pathlib.Path('results', '_{}'.format(timestamp))
-    result_dir.mkdir(exist_ok=True, parents=True)
-
-    run_use_cases(data_dict)
-
-
-def run_tracbev_potential(data_dict):
-    bounds = data_dict['boundaries']
-
-    # create result directory
-    timestamp_now = datetime.now()
-    timestamp = timestamp_now.strftime("%y-%m-%d_%H%M%S")
-    result_dir = pathlib.Path('results', '{}_{}'.format(data_dict['scenario_name'], timestamp))
-    result_dir.mkdir(exist_ok=True, parents=True)
-
-    for key in data_dict['AGS'].values():
-        region = bounds.loc[key, 'geometry']
-        region = gpd.GeoSeries(region)  # format to geo series, otherwise problems plotting
-
-        data_dict.update({'result_dir': result_dir, 'region': region, 'key': key})
-        # Start Use Cases
-        run_use_cases(data_dict)
-
-
 def main():
     print('Reading TracBEV input data...')
 
     parser = argparse.ArgumentParser(description='TracBEV tool for allocation of charging infrastructure')
     parser.add_argument('scenario', nargs='?',
-                           help='Set name of the scenario directory')
+                           help='Set name of the scenario directory', default="scenario")
     parser.add_argument('--mode', default="default", type=str, help="Choose simulation mode: default "
                                                                     "(using SimBEV inputs) or potential "
                                                                     "(returning all potential spots in the region)")
@@ -195,7 +163,7 @@ def main():
 
     data = parse_default_data(p_args)
 
-    run_distribution(data)
+    run_use_cases(data)
 
 if __name__ == '__main__':
     main()

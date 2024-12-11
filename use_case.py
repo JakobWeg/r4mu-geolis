@@ -92,17 +92,14 @@ def public(
 
     uc_id = "public"
     print("Use case: " + uc_id)
-    if uc_dict["mode"] == "potential":
-        num_public = 1000000
-        energy_sum = 1
-    else:
-        ts_dict = uc_dict["timeseries"]
-        load = ts_dict[uc_dict['key']].loc[:, "sum public"]
-        load_sum = load.sum()
-        energy_sum = load_sum * timestep / 60
-        load_peak = load.max()
-        charge_info = uc_dict["charge_info"][uc_id]
-        num_public = math.ceil(load_peak / charge_info["avg_power"] * charge_info["c_factor"])
+
+    ts_dict = uc_dict["charging_event"]
+    load = ts_dict[uc_dict['key']].loc[:, "sum public"]
+    load_sum = load.sum()
+    energy_sum = load_sum * timestep / 60
+    load_peak = load.max()
+    charge_info = uc_dict["charge_info"][uc_id]
+    num_public = math.ceil(load_peak / charge_info["avg_power"] * charge_info["c_factor"])
     if num_public > 0:
         # filter hpc points by region
         in_region_bool = public_points["geometry"].within(uc_dict["region"].loc[0])
@@ -153,35 +150,29 @@ def home(
     uc_id = "home"
     print("Use case: " + uc_id)
 
-    ts_dict = uc_dict["charging_event"]
-    load = ts_dict[uc_dict['key']].loc[:, "sum home"]
-    load_sum = load.sum()
-    energy_sum = load_sum * timestep / 60
-    if len(car_num.index) == 1:
-        car_sum = sum(car_num.at["single_region"].values())
-    else:
-        car_sum = sum(car_num.at[uc_dict['key']].values())
-    num_home = math.ceil(car_sum * home_charge_prob)
+    charging_events = uc_dict["charging_event"]
 
-    if num_home > 0:
-        # filter houses by region
-        in_region_bool = home_data["geometry"].within(uc_dict["region"].loc[0])
-        in_region = home_data.loc[in_region_bool].copy()
-        in_region[["num", "num_mfh"]] = in_region[["num", "num_mfh"]].fillna(value=0)
-        potential = uc_helpers.apportion_home(in_region, num_home, uc_dict)
-        in_region["charge_spots"] = potential
-        in_region = in_region.loc[in_region["charge_spots"] > 0]
-        in_region["energy"] = energy_sum * in_region["charge_spots"] / num_home
-        in_region = in_region.sort_values(by="energy", ascending=False)
-        # in_region = in_region.iloc[:num_home]
-        # in_region = in_region.assign(energy=energy_sum/num_home)
-        # outputs
-        print(round(energy_sum, 1), "kWh got charged in region")
-        if uc_dict["visual"]:
-            plots.plot_uc(uc_id, in_region, uc_dict)
-        cols = ["geometry", "charge_spots", "energy"]
-        utility.save(in_region, uc_id, cols, uc_dict)
+    # filter houses by region
+    #in_region_bool = home_data["geometry"].within(uc_dict["boundaries"].iloc[0,0])
+    #in_region = home_data.loc[in_region_bool].copy()
+    in_region = home_data
+    in_region = in_region.iloc[:800]
+    charging_locations_home, located_charging_events = uc_helpers.distribute_charging_events(in_region, charging_events,
+                                                                                             weight_column="building_area",
+                                                                                             simulation_steps=2000)
 
+    # Merge Chargin_events and Locations
+    charging_locations_home["index"]=charging_locations_home.index
+    located_charging_events = located_charging_events.merge(charging_locations_home, left_on="assigned_location",
+                                                            right_on="index")
+    drop_cols = ["osm_id", "amenity", "building", "building_area", "synthetic", "ags", "overlay_id", "nuts", "bus_id", "probability"]
+    located_charging_events = located_charging_events.drop(columns=drop_cols)
+    located_charging_events_gdf = gpd.GeoDataFrame(located_charging_events, geometry="geometry")
+    located_charging_events_gdf.set_crs(3035)
+
+    cols = ["geometry", "charge_spots", "energy"]
+    utility.save(charging_locations_home, uc_id, "charging-locations", uc_dict)
+    utility.save(located_charging_events_gdf, uc_id, "charging-events", uc_dict)
 
 def work(
         landuse, weights_dict,
