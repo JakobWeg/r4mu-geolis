@@ -59,3 +59,37 @@ def distribute_charging_events(locations: gpd.GeoDataFrame, events: pd.DataFrame
     events = events.sort_values(by="assigned_location")
 
     return locations, events
+
+# used in preprocessing only
+def poi_cluster(poi_data, max_radius, max_weight, increment):
+    coords = []
+    weights = []
+    areas = []
+    print("POI in area: {}".format(len(poi_data)))
+    while len(poi_data):
+        radius = increment
+        weight = 0
+        # take point of first row
+        coord = poi_data.iat[0, 0]
+        condition = True
+        while condition:
+            # create radius circle around point
+            area = coord.buffer(radius)
+            # select all POI within circle
+            in_area_bool = poi_data["geometry"].within(area)
+            in_area = poi_data.loc[in_area_bool]
+            weight = in_area["weight"].sum()
+            radius += increment
+            condition = radius <= max_radius and weight <= max_weight
+
+        # calculate combined weight
+        coords.append(coord)
+        weights.append(weight)
+        areas.append(radius - increment)
+        # delete all used points from poi data
+        poi_data = poi_data.drop(in_area.index.tolist())
+
+    # create cluster geodataframe
+    result_dict = {"geometry": coords, "potential": weights, "radius": areas}
+
+    return gpd.GeoDataFrame(result_dict, crs="EPSG:3035")

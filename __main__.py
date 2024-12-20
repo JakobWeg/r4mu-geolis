@@ -28,7 +28,7 @@ def parse_data(args):
     run_public = parser.getboolean('use_cases', 'public')
     run_home = parser.getboolean('use_cases', 'home')
     run_work = parser.getboolean('use_cases', 'work')
-    run_retail = parser.getboolean('use_cases', 'work')
+    run_retail = parser.getboolean('use_cases', 'retail')
 
     # always used parameters
     boundaries = gpd.read_file(pathlib.Path(data_dir, parser.get('data', 'boundaries')))
@@ -63,42 +63,75 @@ def parse_data(args):
         hpc_pos_file = parser.get('data', 'hpc_positions')
         positions = gpd.read_file(pathlib.Path(data_dir, hpc_pos_file))
         config_dict["hpc_points"] = positions
+        if run_retail:
+            config_dict["hpc_share_retail"] = parser.getfloat("uc_params", "hpc_share_retail"),
+        print("--- parsing hpc data done ---")
 
     if run_public:
         public_data_file = parser.get('data', 'public_poi')
         public_data = gpd.read_file(pathlib.Path(data_dir, public_data_file))
-        public_pos_file = parser.get('data', 'public_positions')
-        public_positions = gpd.read_file(pathlib.Path(data_dir, public_pos_file))
-        config_dict.update({'poi_data': public_data, 'public_positions': public_positions})
+        # public_pos_file = parser.get('data', 'public_positions')
+        # public_positions = gpd.read_file(pathlib.Path(data_dir, public_pos_file))
+        config_dict.update({'poi_data': public_data})
+        print("--- parsing public data done ---")
 
     if run_home:
         # zensus_data_file = parser.get('data', 'zensus_data')
         # zensus_data = gpd.read_file(pathlib.Path(data_dir, zensus_data_file))
         # zensus_data = zensus_data.to_crs(3035)
-        buildings_data_file = parser.get('data', 'buildings_data')
+        buildings_data_file_apartment = parser.get('data', 'home_data_apartment')
         print("--- parsing building data ---")
-        buildings_data = gpd.read_file(pathlib.Path(data_dir, buildings_data_file),
+        home_data_apartment = gpd.read_file(pathlib.Path(data_dir, buildings_data_file_apartment),
+                                       engine='pyogrio', use_arrow=True) # engine='pyogrio',
+        buildings_data_file_detached = parser.get('data', 'home_data_detached')
+        print("--- parsing building data ---")
+        home_data_detached = gpd.read_file(pathlib.Path(data_dir, buildings_data_file_detached),
                                        engine='pyogrio', use_arrow=True) # engine='pyogrio',
         # buildings_data = read_dataframe(pathlib.Path(data_dir, buildings_data_file))
-        print("--- parsing building data done ---")
-        buildings_data = buildings_data.to_crs(3035)
+        print("--- parsing home data done ---")
+        buildings_data_file_detached = home_data_detached.to_crs(3035)
+        buildings_data_file_apartment = home_data_apartment.to_crs(3035)
 
         config_dict.update({
             "sfh_available": parser.getfloat("uc_params", "single_family_home_share"),
             "sfh_avg_spots": parser.getfloat("uc_params", "single_family_home_spots"),
             "mfh_available": parser.getfloat("uc_params", "multi_family_home_share"),
             "mfh_avg_spots": parser.getfloat("uc_params", "multi_family_home_spots"),
-            "buildings": buildings_data
+            "home_data_apartment": buildings_data_file_apartment,
+            "home_data_detached": buildings_data_file_detached,
         })
 
     if run_work:
         work_retail = float(parser.get('uc_params', 'work_weight_retail'))
         work_commercial = float(parser.get('uc_params', 'work_weight_commercial'))
         work_industrial = float(parser.get('uc_params', 'work_weight_industrial'))
-        work = gpd.read_file(pathlib.Path(data_dir, 'landuse.gpkg'))
+        path_work_data = parser.get('data', 'work_data')
+        work = gpd.read_file(pathlib.Path(data_dir, path_work_data),
+                             engine='pyogrio', use_arrow=True)
         work = work.to_crs(3035)
         work_dict = {'retail': work_retail, 'commercial': work_commercial, 'industrial': work_industrial}
         config_dict.update({'work': work, 'work_dict': work_dict})
+        print("--- parsing work data done ---")
+
+    if run_retail:
+        # zensus_data_file = parser.get('data', 'zensus_data')
+        # zensus_data = gpd.read_file(pathlib.Path(data_dir, zensus_data_file))
+        # zensus_data = zensus_data.to_crs(3035)
+        retail_data_file = parser.get('data', 'retail_data')
+        print("--- parsing building data ---")
+        retail_data = gpd.read_file(pathlib.Path(data_dir, retail_data_file),
+                                       engine='pyogrio', use_arrow=True) # engine='pyogrio',
+        # buildings_data = read_dataframe(pathlib.Path(data_dir, buildings_data_file))
+        print("--- parsing retail data done ---")
+        retail_data = retail_data.to_crs(3035)
+
+        config_dict.update({
+            "sfh_available": parser.getfloat("uc_params", "single_family_home_share"),
+            "sfh_avg_spots": parser.getfloat("uc_params", "single_family_home_spots"),
+            "mfh_available": parser.getfloat("uc_params", "multi_family_home_share"),
+            "mfh_avg_spots": parser.getfloat("uc_params", "multi_family_home_spots"),
+            "retail_parking_lots": retail_data
+        })
 
     return config_dict
 
@@ -137,19 +170,23 @@ def run_use_cases(data_dict):
         uc.hpc(data_dict['hpc_points'], data_dict)
 
     if data_dict['run_public']:
-        uc.public(data_dict['public_positions'], data_dict['poi_data'],
+        uc.public(data_dict['poi_data'],
                   data_dict)
 
     if data_dict['run_home']:
-        uc.home(data_dict['buildings'],
-                data_dict, 0, 0)
+
+        uc.home(data_dict['home_data_detached'],
+                data_dict, mode="detached")
+        uc.home(data_dict['home_data_apartment'],
+                data_dict, mode="apartment")
 
     if data_dict['run_work']:
         uc.work(data_dict['work'],
-                data_dict['work_dict'],
                 data_dict)
 
-
+    if data_dict['run_retail']:
+        uc.retail(data_dict['retail_parking_lots'],
+                data_dict)
 def main():
     print('Reading TracBEV input data...')
 
@@ -166,4 +203,5 @@ def main():
     run_use_cases(data)
 
 if __name__ == '__main__':
+    # todo: einarbeiten der bestehenden LIS (Im UC Public, Retail und hpc)
     main()

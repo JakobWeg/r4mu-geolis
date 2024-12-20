@@ -2,7 +2,54 @@ import pandas as pd
 import os
 from pathlib import Path
 import geopandas as gpd
+import numpy as np
 from shapely.ops import unary_union, polygonize
+from shapely.geometry import Point
+from sklearn.cluster import DBSCAN
+
+def cluster_poi_data(data_path, eps=0.01, min_samples=10):
+    """
+    Create charging locations from POIs using clustering.
+
+    Parameters:
+        pois_gdf (gpd.GeoDataFrame): GeoDataFrame containing POIs with a geometry column.
+        eps (float): Maximum distance between points to form a cluster (in coordinate units).
+        min_samples (int): Minimum number of points to form a cluster.
+
+    Returns:
+        gpd.GeoDataFrame: GeoDataFrame of charging locations with weights based on cluster sizes.
+    """
+    # Ensure POIs have a geometry column
+
+    pois_gdf = gpd.read_file(data_path)
+
+    if "geometry" not in pois_gdf.columns:
+        raise ValueError("POIs GeoDataFrame must contain a 'geometry' column.")
+
+    # Extract coordinates from the geometry column
+    coords = np.array([[point.x, point.y] for point in pois_gdf.geometry])
+
+    # Perform DBSCAN clustering
+    clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(coords)
+
+    # Add cluster labels to the POIs GeoDataFrame
+    pois_gdf["cluster"] = clustering.labels_
+
+    # Filter out noise points (label = -1)
+    clustered_pois = pois_gdf[pois_gdf["cluster"] != -1]
+
+    # Group by cluster and calculate cluster centroids and weights
+    cluster_groups = clustered_pois.groupby("cluster").geometry.apply(lambda x: x.unary_union.centroid)
+    cluster_weights = clustered_pois.groupby("cluster").size()
+
+    # Create a GeoDataFrame for charging locations
+    charging_locations = gpd.GeoDataFrame({
+        "geometry": cluster_groups,
+        "weight": cluster_weights
+    }, crs=pois_gdf.crs).reset_index(drop=True)
+
+    return charging_locations
+
 
 def merge_geometries_to_polygon():
     """
@@ -54,6 +101,7 @@ def filter_points_within_boundary():
     # Lade die Punkte- und Grenzdaten
     print("loading boundaries")
     boundary_gdf = gpd.read_file("data/Boundaries_Berlin_polygon.gpkg")
+    boundary_gdf = boundary_gdf.to_crs(3035)
 
     # Überprüfen, ob die Grenze ein einzelnes Polygon ist, und sicherstellen, dass es validiert ist
     if boundary_gdf.geometry.unary_union.is_valid:
@@ -62,13 +110,14 @@ def filter_points_within_boundary():
         raise ValueError("Die Grenze ist ungültig. Bitte überprüfen Sie die Eingabedaten.")
     # Lade die Punkte- und Grenzdaten
     print("loading points")
-    points_gdf = gpd.read_file("data/374-all_buildings.gpkg",
+    points_gdf = gpd.read_file("data/poi_cluster.gpkg",
                                    engine='pyogrio', use_arrow=True)
+    points_gdf = points_gdf.to_crs(3035)
     # Filtere Punkte, die innerhalb der Grenze liegen
     points_within_boundary = points_gdf[points_gdf.geometry.within(boundary)]
 
     # Speichere das gefilterte Ergebnis als GeoPackage
-    points_within_boundary.to_file("data/374-all_buildings_berlin.gpkg", driver='GPKG')
+    points_within_boundary.to_file("data/poi_cluster_berlin.gpkg", driver='GPKG')
     print(f"Gefilterte Punkte erfolgreich in data gespeichert.")
 
 
@@ -159,6 +208,19 @@ def convert_geodata_for_uc_work(landusepath, alkispath):
 def convert_geodata_for_uc_street(landusepath, alkispath):
     print("converting_geodata_for_uc_street")
 
+def convert_geodata_for_uc_retail(path):
+    retail_gdf = gpd.read_file(path)
+    columns = ['id_0', 'osm_id', 'osm_way_id', 'area',
+       'category', 'geometry']
+    retail_gdf = retail_gdf.loc[:,columns]
+    retail_gdf["area"] = retail_gdf.area
+    retail_gdf['centroid'] = retail_gdf.geometry.centroid  # Zentroid berechnen (optional, wenn du die Originalgeometrien behalten willst)
+    retail_gdf.set_geometry('centroid', inplace=True)
+    retail_gdf = retail_gdf.drop(columns=["geometry"])
+
+    retail_gdf.to_file("data/retail_parking_lots_points.gpkg", driver='GPKG')
+    print(f"Gefilterte Punkte erfolgreich in data gespeichert.")
+
 
 # Beispielnutzung
 if __name__ == "__main__":
@@ -166,6 +228,8 @@ if __name__ == "__main__":
     # print(charging_events)
     # combine_csv_to_parquet("//FS01/RedirectedFolders/Jakob.Wegner/Desktop/r4mu_übergabe/2045/scaling_1000_fix_default_2024-12-05_114939_simbev_run/SR_Metro",
     #                        "scenario/combined_charging_events_2045_1.parquet")
-    convert_geodata_for_uc_work(landusepath="data/Reale_Nutzung_2021_Umweltatlas.gpkg", alkispath="data/ALKIS_Berlin_Gebäude.gpkg")
+    # convert_geodata_for_uc_work(landusepath="data/Reale_Nutzung_2021_Umweltatlas.gpkg", alkispath="data/ALKIS_Berlin_Gebäude.gpkg")
     # filter_points_within_boundary()
     # merge_geometries_to_polygon()
+    # cluster_poi_data(datapath="")
+    convert_geodata_for_uc_retail("data/Retailer_parking_lots.gpkg")
