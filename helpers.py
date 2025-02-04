@@ -110,14 +110,14 @@ def filter_points_within_boundary():
         raise ValueError("Die Grenze ist ungültig. Bitte überprüfen Sie die Eingabedaten.")
     # Lade die Punkte- und Grenzdaten
     print("loading points")
-    points_gdf = gpd.read_file("data/poi_cluster.gpkg",
-                                   engine='pyogrio', use_arrow=True)
+    points_gdf = gpd.read_file("data/teo_data/osm_landuse_industry.gpkg",
+                               engine='pyogrio', use_arrow=True)
     points_gdf = points_gdf.to_crs(3035)
     # Filtere Punkte, die innerhalb der Grenze liegen
     points_within_boundary = points_gdf[points_gdf.geometry.within(boundary)]
 
     # Speichere das gefilterte Ergebnis als GeoPackage
-    points_within_boundary.to_file("data/poi_cluster_berlin.gpkg", driver='GPKG')
+    points_within_boundary.to_file("data/mobi_data/osm_landuse_industry_berlin.gpkg", driver='GPKG')
     print(f"Gefilterte Punkte erfolgreich in data gespeichert.")
 
 
@@ -229,7 +229,7 @@ if __name__ == "__main__":
     # combine_csv_to_parquet("//FS01/RedirectedFolders/Jakob.Wegner/Desktop/r4mu_übergabe/2045/scaling_1000_fix_default_2024-12-05_114939_simbev_run/SR_Metro",
     #                        "scenario/combined_charging_events_2045_1.parquet")
     # convert_geodata_for_uc_work(landusepath="data/Reale_Nutzung_2021_Umweltatlas.gpkg", alkispath="data/ALKIS_Berlin_Gebäude.gpkg")
-    # filter_points_within_boundary()
+    filter_points_within_boundary()
     # merge_geometries_to_polygon()
     # cluster_poi_data(datapath="")
-    convert_geodata_for_uc_retail("data/Retailer_parking_lots.gpkg")
+    # convert_geodata_for_uc_retail("data/Retailer_parking_lots.gpkg")

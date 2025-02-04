@@ -6,6 +6,7 @@ import argparse
 from datetime import datetime
 import pathlib
 from pyogrio import read_dataframe
+import os
 
 import use_case as uc
 
@@ -79,14 +80,20 @@ def parse_data(args):
         # zensus_data_file = parser.get('data', 'zensus_data')
         # zensus_data = gpd.read_file(pathlib.Path(data_dir, zensus_data_file))
         # zensus_data = zensus_data.to_crs(3035)
-        buildings_data_file_apartment = parser.get('data', 'home_data_apartment')
-        print("--- parsing building data ---")
-        home_data_apartment = gpd.read_file(pathlib.Path(data_dir, buildings_data_file_apartment),
+        buildings_data_file = parser.get('data', 'building_data')
+        demand_profiles_data = parser.get('data', 'home_demand_profiles')
+
+        home_data = gpd.read_file(pathlib.Path(data_dir, buildings_data_file),
                                        engine='pyogrio', use_arrow=True) # engine='pyogrio',
-        buildings_data_file_detached = parser.get('data', 'home_data_detached')
-        print("--- parsing building data ---")
-        home_data_detached = gpd.read_file(pathlib.Path(data_dir, buildings_data_file_detached),
-                                       engine='pyogrio', use_arrow=True) # engine='pyogrio',
+
+        demand_profiles = pd.read_csv(pathlib.Path(data_dir, demand_profiles_data))
+        demand_profiles.rename(columns={'building_id': 'id'}, inplace=True)
+        home_data = home_data.merge(demand_profiles[["id", "households_total"]], on='id', how='left')
+
+        home_data = home_data.loc[(home_data["cts"].astype(float) == 0) & (home_data["households_total"].notna())]
+
+        home_data_detached = home_data.loc[home_data["households_total"].isin([1, 2])]
+        home_data_apartment = home_data.loc[~home_data["households_total"].isin([1, 2])]
         # buildings_data = read_dataframe(pathlib.Path(data_dir, buildings_data_file))
         print("--- parsing home data done ---")
         buildings_data_file_detached = home_data_detached.to_crs(3035)
@@ -105,12 +112,13 @@ def parse_data(args):
         work_retail = float(parser.get('uc_params', 'work_weight_retail'))
         work_commercial = float(parser.get('uc_params', 'work_weight_commercial'))
         work_industrial = float(parser.get('uc_params', 'work_weight_industrial'))
-        path_work_data = parser.get('data', 'work_data')
-        work = gpd.read_file(pathlib.Path(data_dir, path_work_data),
+        buildings_data_file = parser.get('data', 'building_data')
+        work_data = gpd.read_file(pathlib.Path(data_dir, buildings_data_file),
                              engine='pyogrio', use_arrow=True)
-        work = work.to_crs(3035)
+        work_data = work_data.loc[work_data["cts"].astype(float) != 0]
+        work_data = work_data.to_crs(3035)
         work_dict = {'retail': work_retail, 'commercial': work_commercial, 'industrial': work_industrial}
-        config_dict.update({'work': work, 'work_dict': work_dict})
+        config_dict.update({'work': work_data, 'work_dict': work_dict})
         print("--- parsing work data done ---")
 
     if run_retail:
@@ -118,12 +126,13 @@ def parse_data(args):
         # zensus_data = gpd.read_file(pathlib.Path(data_dir, zensus_data_file))
         # zensus_data = zensus_data.to_crs(3035)
         retail_data_file = parser.get('data', 'retail_data')
-        print("--- parsing building data ---")
+
         retail_data = gpd.read_file(pathlib.Path(data_dir, retail_data_file),
                                        engine='pyogrio', use_arrow=True) # engine='pyogrio',
         # buildings_data = read_dataframe(pathlib.Path(data_dir, buildings_data_file))
         print("--- parsing retail data done ---")
         retail_data = retail_data.to_crs(3035)
+        retail_data["geometry"] = retail_data["geometry"].centroid
 
         config_dict.update({
             "sfh_available": parser.getfloat("uc_params", "single_family_home_share"),
@@ -140,8 +149,19 @@ def parse_car_data(args, data_dict):
     scenario_path = pathlib.Path(args.scenario, data_dict["charge_events_path"])
     ts_path = pathlib.Path(scenario_path, )
 
+    dataframes = []
+
+    for file in os.listdir(ts_path):
+        if file.endswith(".parquet"):
+            file_path = os.path.join(ts_path, file)
+            df = pd.read_parquet(file_path)  # Read the Parquet file
+            dataframes.append(df)
+
+    # Concatenate all DataFrames vertically
+    charging_events = pd.concat(dataframes, ignore_index=True)
+
     # charging_events = pd.read_csv(ts_path, sep=",")
-    charging_events = pd.read_parquet(ts_path)
+    # charging_events = pd.read_parquet(ts_path)
     charging_events = charging_events.loc[charging_events["station_charging_capacity"] != 0]
     print ("--- parsing charging events done")
 

@@ -36,6 +36,8 @@ def distribute_charging_events(locations: gpd.GeoDataFrame, events: pd.DataFrame
     # Add a column to events to store assigned location
     events["assigned_location"] = np.nan
 
+    len_events = len(events)
+    print("distributing...")
     # Distribute events
     for event_idx, event in events.iterrows():
         start_time, end_time = event["event_start"], (event["event_start"] + event["event_time"])
@@ -55,8 +57,13 @@ def distribute_charging_events(locations: gpd.GeoDataFrame, events: pd.DataFrame
             locations.at[assigned_location, "required_points"],
             max_points_in_use + 1
         )
+        idx = int(event_idx)
+        percent_complete = (idx + 1) / len_events * 100
+        if (idx + 1) % (len_events // 10000) == 0:
+            print(f"\rProgress: {percent_complete:.2f}%", end='', flush=True) #, end="\r"
 
     events = events.sort_values(by="assigned_location")
+    print()
 
     return locations, events
 
