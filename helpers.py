@@ -6,8 +6,11 @@ import numpy as np
 from shapely.ops import unary_union, polygonize
 from shapely.geometry import Point
 from sklearn.cluster import DBSCAN
+#from osgeo import ogr
+import fiona
+from shapely.geometry import shape, mapping
 
-def cluster_poi_data(data_path, eps=0.01, min_samples=10):
+def cluster_public_data(eps=0.001, min_samples=1):
     """
     Create charging locations from POIs using clustering.
 
@@ -21,22 +24,23 @@ def cluster_poi_data(data_path, eps=0.01, min_samples=10):
     """
     # Ensure POIs have a geometry column
 
-    pois_gdf = gpd.read_file(data_path)
+    #points_gdf = gpd.read_file("data/poi_cluster_berlin.gpkg")
+    points_gdf = gpd.read_file("data/teo_data/osm_buildings_residential_cts_berlin.gpkg")
 
-    if "geometry" not in pois_gdf.columns:
+    if "geometry" not in points_gdf.columns:
         raise ValueError("POIs GeoDataFrame must contain a 'geometry' column.")
 
     # Extract coordinates from the geometry column
-    coords = np.array([[point.x, point.y] for point in pois_gdf.geometry])
+    coords = np.array([[point.x, point.y] for point in points_gdf.geometry])
 
     # Perform DBSCAN clustering
     clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(coords)
 
     # Add cluster labels to the POIs GeoDataFrame
-    pois_gdf["cluster"] = clustering.labels_
+    points_gdf["cluster"] = clustering.labels_
 
     # Filter out noise points (label = -1)
-    clustered_pois = pois_gdf[pois_gdf["cluster"] != -1]
+    clustered_pois = points_gdf[points_gdf["cluster"] != -1]
 
     # Group by cluster and calculate cluster centroids and weights
     cluster_groups = clustered_pois.groupby("cluster").geometry.apply(lambda x: x.unary_union.centroid)
@@ -46,7 +50,10 @@ def cluster_poi_data(data_path, eps=0.01, min_samples=10):
     charging_locations = gpd.GeoDataFrame({
         "geometry": cluster_groups,
         "weight": cluster_weights
-    }, crs=pois_gdf.crs).reset_index(drop=True)
+    }, crs=points_gdf.crs).reset_index(drop=True)
+
+    charging_locations.to_file("data/home_street_cluster_new.gpkg", driver='GPKG')
+    print(f"Gefilterte Punkte erfolgreich in data gespeichert.")
 
     return charging_locations
 
@@ -110,15 +117,74 @@ def filter_points_within_boundary():
         raise ValueError("Die Grenze ist ungültig. Bitte überprüfen Sie die Eingabedaten.")
     # Lade die Punkte- und Grenzdaten
     print("loading points")
-    points_gdf = gpd.read_file("data/teo_data/osm_landuse_industry.gpkg",
+    points_gdf = gpd.read_file("data/teo_data/2025_03_28_new/osm_landuse_industry.gpkg",
                                engine='pyogrio', use_arrow=True)
     points_gdf = points_gdf.to_crs(3035)
     # Filtere Punkte, die innerhalb der Grenze liegen
     points_within_boundary = points_gdf[points_gdf.geometry.within(boundary)]
 
     # Speichere das gefilterte Ergebnis als GeoPackage
-    points_within_boundary.to_file("data/mobi_data/osm_landuse_industry_berlin.gpkg", driver='GPKG')
+    points_within_boundary.to_file("data/teo_data/2025_03_28_new/osm_landuse_industry_new.gpkg", driver='GPKG')
     print(f"Gefilterte Punkte erfolgreich in data gespeichert.")
+
+    # # Öffne das Geopackage mit dem Polygon
+    # polygon_ds = ogr.Open("data/Boundaries_Berlin_polygon.gpkg")
+    # polygon_layer = polygon_ds
+    #
+    # # Nimm das erste Polygon aus dem Layer (du kannst auch über mehrere iterieren)
+    # polygon_feature = polygon_layer.GetNextFeature()
+    # polygon_geom = polygon_feature.GetGeometryRef()
+    #
+    # # Öffne den Punktlayer (kann auch im selben GPKG sein)
+    # points_ds = ogr.Open("data/Boundaries_Berlin_polygon.gpkg")
+    # points_layer = points_ds.GetLayerByName("punkte_layername")
+    #
+    # # Schleife durch Punkte und prüfe, ob sie im Polygon liegen
+    # for point_feature in points_layer:
+    #     point_geom = point_feature.GetGeometryRef()
+    #     if point_geom.Within(polygon_geom):
+    #         print("Treffer:", point_geom.ExportToWkt())
+
+# # Eingabedateien
+# polygon_path = "data/Boundaries_Berlin_polygon.gpkg"
+#
+# punkte_path = "data/teo_data/2025_03_28_new/osm_buildings_residential_cts.gpkg"
+#
+#
+# # Ausgabedatei
+# output_path = "data/teo_data/data/teo_data/osm_buildings_residential_cts_berlin_new.gpkg"
+#
+#
+# # Lade erstes Polygon aus dem Polygon-Layer
+# with fiona.open(polygon_path) as polygon_src:
+#     polygon_geom = shape(polygon_src['geometry'])
+#     crs = polygon_src.crs  # Koordinatensystem für spätere Ausgabe
+#
+# # Lade Punkte und filtere
+# gefilterte_punkte = []
+# with fiona.open(punkte_path) as point_src:
+#     schema = point_src.schema  # Geometrie- und Attributschema übernehmen
+#
+#     for feature in point_src:
+#         punkt_geom = shape(feature['geometry'])
+#         if punkt_geom.within(polygon_geom):
+#             gefilterte_punkte.append({
+#                 'geometry': mapping(punkt_geom),
+#                 'properties': feature['properties']
+#             })
+#
+# # Speichere gefilterte Punkte in ein neues Geopackage
+# with fiona.open(
+#     output_path,
+#     mode='w',
+#     driver='GPKG',
+#     schema=schema,
+#     crs=crs
+# ) as output:
+#     for punkt in gefilterte_punkte:
+#         output.write(punkt)
+#
+# print(f"✅ {len(gefilterte_punkte)} Punkte wurden gespeichert in '{output_path}'")
 
 
 def combine_csv_to_parquet(csv_folder_path, output_file):
@@ -221,6 +287,35 @@ def convert_geodata_for_uc_retail(path):
     retail_gdf.to_file("data/retail_parking_lots_points.gpkg", driver='GPKG')
     print(f"Gefilterte Punkte erfolgreich in data gespeichert.")
 
+def calculate_share_of_public_home_charging():
+    print("calculate")
+
+    ts_path = Path("scenario/Ladeprofile_Privatverkehr_parquet")
+
+    dataframes = []
+
+    for file in os.listdir(ts_path):
+        if file.endswith(".parquet"):
+            file_path = os.path.join(ts_path, file)
+            df = pd.read_parquet(file_path)  # Read the Parquet file
+            dataframes.append(df)
+
+    # Concatenate all DataFrames vertically
+    charging_events = pd.concat(dataframes, ignore_index=True)
+
+    # charging_events = pd.read_csv(ts_path, sep=",")
+    # charging_events = pd.read_parquet(ts_path)
+    charging_events = charging_events.loc[charging_events["station_charging_capacity"] != 0]
+
+    charging_events_street = charging_events.loc[charging_events["charging_use_case"] == "street"]
+
+    charging_events_street_home = charging_events_street.loc[charging_events_street["location"] == "home"]
+
+    share_street_home_charging = len(charging_events_street_home)/len(charging_events_street)
+
+    share_street_not_at_home_charging = len(charging_events_street.loc[charging_events_street["location"] != "home"])/len(charging_events_street)
+
+    print("share_street while beeing at home:", share_street_home_charging, share_street_not_at_home_charging)
 
 # Beispielnutzung
 if __name__ == "__main__":
@@ -231,5 +326,6 @@ if __name__ == "__main__":
     # convert_geodata_for_uc_work(landusepath="data/Reale_Nutzung_2021_Umweltatlas.gpkg", alkispath="data/ALKIS_Berlin_Gebäude.gpkg")
     filter_points_within_boundary()
     # merge_geometries_to_polygon()
-    # cluster_poi_data(datapath="")
+    # cluster_public_data()
     # convert_geodata_for_uc_retail("data/Retailer_parking_lots.gpkg")
+    #calculate_share_of_public_home_charging()

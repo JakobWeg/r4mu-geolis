@@ -30,6 +30,7 @@ def parse_data(args):
     run_home = parser.getboolean('use_cases', 'home')
     run_work = parser.getboolean('use_cases', 'work')
     run_retail = parser.getboolean('use_cases', 'retail')
+    run_depot = parser.getboolean('use_cases', 'depot')
 
     # always used parameters
     boundaries = gpd.read_file(pathlib.Path(data_dir, parser.get('data', 'boundaries')))
@@ -51,12 +52,14 @@ def parse_data(args):
         'run_home': run_home,
         'run_work': run_work,
         'run_retail': run_retail,
+        'run_depot': run_depot,
         'visual': parser.getboolean("basic", "plots"),
         # 'charge_info': charge_info_dict,
         'scenario_name': args.scenario,
         'random_seed': rng,
         'mode': args.mode,
-        'charge_events_path': parser.get('data', 'charging_events'),
+        'charge_events_private_path': parser.get('data', 'charging_events_private'),
+        'charge_events_commercial_path': parser.get('data', 'charging_events_commercial'),
         'result_dir': result_dir
     }
 
@@ -71,15 +74,17 @@ def parse_data(args):
     if run_public:
         public_data_file = parser.get('data', 'public_poi')
         public_data = gpd.read_file(pathlib.Path(data_dir, public_data_file))
+
+        public_home_street_data_file = parser.get('data', 'public_home_street')
+        public_home_street_data = gpd.read_file(pathlib.Path(data_dir, public_home_street_data_file))
+
         # public_pos_file = parser.get('data', 'public_positions')
         # public_positions = gpd.read_file(pathlib.Path(data_dir, public_pos_file))
         config_dict.update({'poi_data': public_data})
+        config_dict.update({'home_street_data': public_home_street_data})
         print("--- parsing public data done ---")
 
     if run_home:
-        # zensus_data_file = parser.get('data', 'zensus_data')
-        # zensus_data = gpd.read_file(pathlib.Path(data_dir, zensus_data_file))
-        # zensus_data = zensus_data.to_crs(3035)
         buildings_data_file = parser.get('data', 'building_data')
         demand_profiles_data = parser.get('data', 'home_demand_profiles')
 
@@ -90,7 +95,7 @@ def parse_data(args):
         demand_profiles.rename(columns={'building_id': 'id'}, inplace=True)
         home_data = home_data.merge(demand_profiles[["id", "households_total"]], on='id', how='left')
 
-        home_data = home_data.loc[(home_data["cts"].astype(float) == 0) & (home_data["households_total"].notna())]
+        home_data = home_data.loc[(home_data["cts_demand"].astype(float) == 0) & (home_data["households_total"].notna())]
 
         home_data_detached = home_data.loc[home_data["households_total"].isin([1, 2])]
         home_data_apartment = home_data.loc[~home_data["households_total"].isin([1, 2])]
@@ -100,13 +105,15 @@ def parse_data(args):
         buildings_data_file_apartment = home_data_apartment.to_crs(3035)
 
         config_dict.update({
-            "sfh_available": parser.getfloat("uc_params", "single_family_home_share"),
-            "sfh_avg_spots": parser.getfloat("uc_params", "single_family_home_spots"),
-            "mfh_available": parser.getfloat("uc_params", "multi_family_home_share"),
-            "mfh_avg_spots": parser.getfloat("uc_params", "multi_family_home_spots"),
+            # "sfh_available": parser.getfloat("uc_params", "single_family_home_share"),
+            # "sfh_avg_spots": parser.getfloat("uc_params", "single_family_home_spots"),
+            # "mfh_available": parser.getfloat("uc_params", "multi_family_home_share"),
+            # "mfh_avg_spots": parser.getfloat("uc_params", "multi_family_home_spots"),
             "home_data_apartment": buildings_data_file_apartment,
             "home_data_detached": buildings_data_file_detached,
         })
+        home_data_detached.to_file("data/home_data_detached.gpkg")
+        home_data_apartment.to_file("data/home_data_apartment.gpkg")
 
     if run_work:
         work_retail = float(parser.get('uc_params', 'work_weight_retail'))
@@ -115,7 +122,8 @@ def parse_data(args):
         buildings_data_file = parser.get('data', 'building_data')
         work_data = gpd.read_file(pathlib.Path(data_dir, buildings_data_file),
                              engine='pyogrio', use_arrow=True)
-        work_data = work_data.loc[work_data["cts"].astype(float) != 0]
+        #todo: hier überprüfen, ob wir wirklich nur alle Standorte mit cts_demand != 0 haben wollen
+        work_data = work_data.loc[work_data["cts_demand"].astype(float) != 0]
         work_data = work_data.to_crs(3035)
         work_dict = {'retail': work_retail, 'commercial': work_commercial, 'industrial': work_industrial}
         config_dict.update({'work': work_data, 'work_dict': work_dict})
@@ -142,27 +150,50 @@ def parse_data(args):
             "retail_parking_lots": retail_data
         })
 
+    if run_depot:
+        depot_data_file = parser.get('data', 'depot_data')
+
+        depot_data = gpd.read_file(pathlib.Path(data_dir, depot_data_file),
+                                    engine='pyogrio', use_arrow=True)  # engine='pyogrio',
+
+        config_dict.update({'depot': depot_data})
+
     return config_dict
 
 
 def parse_car_data(args, data_dict):
-    scenario_path = pathlib.Path(args.scenario, data_dict["charge_events_path"])
-    ts_path = pathlib.Path(scenario_path, )
+    scenario_path = pathlib.Path(args.scenario)
+    ts_private_path = pathlib.Path(scenario_path, data_dict["charge_events_private_path"])
+    ts_commercial_path = pathlib.Path(scenario_path, data_dict["charge_events_commercial_path"])
 
     dataframes = []
 
-    for file in os.listdir(ts_path):
+    for file in os.listdir(ts_private_path):
         if file.endswith(".parquet"):
-            file_path = os.path.join(ts_path, file)
+            file_path = os.path.join(ts_private_path, file)
             df = pd.read_parquet(file_path)  # Read the Parquet file
             dataframes.append(df)
 
     # Concatenate all DataFrames vertically
-    charging_events = pd.concat(dataframes, ignore_index=True)
+    charging_events_private = pd.concat(dataframes, ignore_index=True)
 
     # charging_events = pd.read_csv(ts_path, sep=",")
     # charging_events = pd.read_parquet(ts_path)
-    charging_events = charging_events.loc[charging_events["station_charging_capacity"] != 0]
+    charging_events_private = charging_events_private.loc[charging_events_private["station_charging_capacity"] != 0]
+
+    charging_events_commercial = pd.read_parquet(ts_commercial_path)
+    charging_events_commercial["charging_use_case"] = charging_events_commercial["charging_use_case"].str.replace(
+        "public", "street", regex=False)
+
+    charging_events_private["Type"] = "Private"
+    charging_events_commercial["Type"] = "Commercial"
+    charging_events_commercial = charging_events_commercial.drop(columns=["charge_end"])
+
+    # todo: check, ob beide Datensätze zur gleichen Zeit am gleichen Tag starten.
+    charging_events = pd.concat([charging_events_private, charging_events_commercial], ignore_index=True, sort=False)
+
+    charging_events = charging_events[charging_events["event_start"] <= (24*7*4)]
+
     print ("--- parsing charging events done")
 
     return charging_events
@@ -190,7 +221,7 @@ def run_use_cases(data_dict):
         uc.hpc(data_dict['hpc_points'], data_dict)
 
     if data_dict['run_public']:
-        uc.public(data_dict['poi_data'],
+        uc.public(data_dict['poi_data'], data_dict['home_street_data'],
                   data_dict)
 
     if data_dict['run_home']:
@@ -207,10 +238,15 @@ def run_use_cases(data_dict):
     if data_dict['run_retail']:
         uc.retail(data_dict['retail_parking_lots'],
                 data_dict)
-def main():
-    print('Reading TracBEV input data...')
 
-    parser = argparse.ArgumentParser(description='TracBEV tool for allocation of charging infrastructure')
+    if data_dict['run_depot']:
+        uc.depot(data_dict['depot'],
+                data_dict)
+
+def main():
+    print('Reading input data...')
+
+    parser = argparse.ArgumentParser(description='Tool for allocation of charging infrastructure')
     parser.add_argument('scenario', nargs='?',
                            help='Set name of the scenario directory', default="scenario")
     parser.add_argument('--mode', default="default", type=str, help="Choose simulation mode: default "
@@ -223,5 +259,5 @@ def main():
     run_use_cases(data)
 
 if __name__ == '__main__':
-    # todo: einarbeiten der bestehenden LIS (Im UC Public, Retail und hpc)
+    # todo: einarbeiten der bestehenden LIS (Im UC Public, Retail und hpc), Niedrige Prio
     main()
