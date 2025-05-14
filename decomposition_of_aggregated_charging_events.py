@@ -6,7 +6,6 @@ from datetime import datetime, timedelta
 from datetime import timedelta
 import random
 
-# todo uncontrolled und controlled Ladeevents zusammen nehmen
 
 # Beispielhafte Ladeparameter pro Use Case
 ladeparameter = {
@@ -20,21 +19,21 @@ ladeparameter = {
 }
 
 # Lade CSV (angenommen: Index ist Zeitstempel, Spalten sind Use-Cases)
-df = pd.read_csv("data/dlr_data/aggregated_result_table_ppc_id_and_week_hour.csv", index_col=0, parse_dates=True)
+df = pd.read_csv("data/dlr_data/2045/aggregated_result_table_ppc_id_and_week_hour.csv", index_col=0, parse_dates=True)
 
-lade_use_cases_def = pd.read_csv("data/dlr_data/charging_stations_availability.csv", sep=";")
+lade_use_cases_def = pd.read_csv("data/dlr_data/2045/charging_stations_availability.csv", sep=";")
 
 mapping = {
     101: "depot",
     102: "depot",
     103: "depot",
-    104: "depot",
-    201: "agrar/bau",
+    104: "street",
+    201: "street",
     301: "home",
     302: "home",
-    401: "other_private",
+    401: "home",
     402: "retail",
-    403: "public"
+    403: "street"
 }
 
 df["use_case"] = df["ppc_id"].map(mapping)
@@ -90,8 +89,8 @@ for use_case in ladeparameter.keys():
 
 # In DataFrame umwandeln und speichern
 events_df = pd.DataFrame(ladeevents)
-events_df.to_csv("data/dlr_data/results_decomposition/simulierte_ladeevents.csv", index=False)
-events_df.to_parquet("data/dlr_data/results_decomposition/simulierte_ladeevents.parquet", index=False)
+events_df.to_csv("data/dlr_data/results_decomposition/simulierte_ladeevents_2045.csv", index=False)
+events_df.to_parquet("data/dlr_data/results_decomposition/simulierte_ladeevents_2045.parquet", index=False)
 
 # test
 print("start of test")
@@ -122,7 +121,7 @@ use_cases = timeline.columns.tolist()
 
 # add day and time
 # Starte Montag 00:00 Uhr
-startzeit_date = datetime.strptime("2025-01-01 00:00", "%Y-%m-%d %H:%M")  # 1. Jan. 2024 ist ein Montag
+startzeit_date = datetime.strptime("2024-01-01 00:00", "%Y-%m-%d %H:%M")  # 1. Jan. 2024 ist ein Montag
 
 # Erstelle eine neue Spalte mit Datum + Uhrzeit
 times = pd.Series(timeline.index.values)
@@ -143,7 +142,7 @@ wochentage_de = {
 }
 timeline['Wochentag_Uhrzeit'] = timeline['Datum_Uhrzeit'].dt.strftime('%A %H:%M').replace(wochentage_de, regex=True)
 
-timeline.to_csv("data/dlr_data/results_decomposition/simulierte_ladeevents_kumuliert.csv", index=False)
+timeline.to_csv("data/dlr_data/results_decomposition/simulierte_ladeevents_kumuliert_2045.csv", index=False)
 # Daten für Stackplot vorbereiten
 #use_cases = timeline.columns.tolist()
 werte = [timeline[uc].values for uc in use_cases]
@@ -158,7 +157,7 @@ plt.ylabel("Anzahl gleichzeitig ladender Fahrzeuge")
 plt.legend(title="Use-Case")
 plt.grid(True)
 plt.tight_layout()
-plt.savefig("data/dlr_data/results_decomposition/simulierte_ladeevents_kumuliert")
+plt.savefig("data/dlr_data/results_decomposition/simulierte_ladeevents_kumuliert_2045")
 
 plt.close()
 
@@ -171,7 +170,7 @@ plt.ylabel("Anzahl gleichzeitig ladender Fahrzeuge")
 plt.legend(title="Use-Case")
 plt.grid(True)
 plt.tight_layout()
-plt.savefig("data/dlr_data/results_decomposition/simulierte_ladeevents_kumuliert")
+plt.savefig("data/dlr_data/results_decomposition/simulierte_ladeevents_kumuliert_2045")
 
 plt.close()
 
@@ -185,4 +184,4 @@ plt.ylabel("Anzahl gleichzeitig ladender Fahrzeuge")
 plt.legend(title="Use-Case")
 plt.grid(True)
 plt.tight_layout()
-plt.savefig("data/dlr_data/results_decomposition/simulierte_ladeevents_kumuliert_Uhrzeit")
+plt.savefig("data/dlr_data/results_decomposition/simulierte_ladeevents_kumuliert_Uhrzeit_2045")
