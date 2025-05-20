@@ -184,13 +184,20 @@ def parse_car_data(args, data_dict):
     charging_events_private["event_start"] = charging_events_private["event_start"] - (24*7*4)
 
     charging_events_commercial = pd.read_parquet(ts_commercial_path)
-    charging_events_commercial["charging_use_case"] = charging_events_commercial["charging_use_case"].str.replace(
+    charging_events_commercial["use_case"] = charging_events_commercial["use_case"].str.replace(
         "public", "street", regex=False)
 
     charging_events_private["Type"] = "Private"
     charging_events_commercial["Type"] = "Commercial"
 
     charging_events_commercial = charging_events_commercial.drop(columns=["charge_end"])
+
+    # verteilung der commercial retail Ladeevents war falsch. Umverteilung von Retail commercial auf street
+
+    # charging_events_commercial["use_case"].loc[
+    #     charging_events_commercial["use_case"].isin(["retail"])] = "street"
+    #
+    charging_events_commercial["charging_use_case"] = charging_events_commercial["use_case"]
 
     # todo: check, ob beide Datensätze zur gleichen Zeit am gleichen Tag starten.
     charging_events = pd.concat([charging_events_private, charging_events_commercial], ignore_index=True, sort=False)
@@ -251,13 +258,6 @@ def run_use_cases(data_dict):
         data_dict["results_summary"][uc_name]["charging_points"], data_dict["results_summary"][uc_name]["energy"], \
             data_dict["results_summary"][uc_name]["installed_power"] = uc.hpc(data_dict['hpc_points'], data_dict)
 
-    if data_dict['run_public']:
-        uc_name = "public"
-        data_dict["results_summary"][uc_name] = {}
-        data_dict["results_summary"][uc_name]["charging_points"], data_dict["results_summary"][uc_name]["energy"], \
-            data_dict["results_summary"][uc_name]["installed_power"] = uc.public(data_dict['poi_data'], data_dict['home_street_data'],
-                  data_dict)
-
     if data_dict['run_home']:
         uc_name = "home_detached"
         data_dict["results_summary"][uc_name] = {}
@@ -282,7 +282,7 @@ def run_use_cases(data_dict):
         data_dict["results_summary"][uc_name] = {}
         if data_dict["multi_use_concept"]:
             data_dict["results_summary"][uc_name]["charging_points"], data_dict["results_summary"][uc_name]["energy"], \
-                data_dict["results_summary"][uc_name]["installed_power"], charging_locations_retail_after_multi_use = (
+                data_dict["results_summary"][uc_name]["installed_power"], charging_locations_public_after_multi_use = (
                 uc.retail(data_dict['retail_parking_lots'],
                     data_dict))
         else:
@@ -293,16 +293,26 @@ def run_use_cases(data_dict):
     if data_dict['run_depot']:
         uc_name = "depot"
         data_dict["results_summary"][uc_name] = {}
+
+        data_dict["results_summary"][uc_name]["charging_points"], data_dict["results_summary"][uc_name]["energy"], \
+        data_dict["results_summary"][uc_name]["installed_power"] = uc.depot(data_dict[uc_name],
+                data_dict)
+
+    if data_dict['run_public']:
+        uc_name = "public"
+        data_dict["results_summary"][uc_name] = {}
+
         if data_dict["multi_use_concept"]:
             data_dict["results_summary"][uc_name]["charging_points"], data_dict["results_summary"][uc_name]["energy"], \
-                data_dict["results_summary"][uc_name]["installed_power"] = uc.depot(data_dict[uc_name],
-                                                                                    data_dict,
-                                                                                    charging_locations_depot_after_multi_use=charging_locations_retail_after_multi_use)
+                data_dict["results_summary"][uc_name]["installed_power"] = uc.public(data_dict['poi_data'],
+                                                                                     data_dict['home_street_data'],
+                                                                                     data_dict,
+                                                                                     charging_locations_public_after_multi_use=charging_locations_public_after_multi_use)
         else:
-
             data_dict["results_summary"][uc_name]["charging_points"], data_dict["results_summary"][uc_name]["energy"], \
-            data_dict["results_summary"][uc_name]["installed_power"] = uc.depot(data_dict[uc_name],
-                    data_dict)
+                data_dict["results_summary"][uc_name]["installed_power"] = uc.public(data_dict['poi_data'],
+                                                                                     data_dict['home_street_data'],
+                                                                                     data_dict)
 
     return data_dict["results_summary"]
 

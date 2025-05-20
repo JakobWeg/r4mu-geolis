@@ -93,6 +93,7 @@ def get_id(use_case_id, location_id):
     return ids.values.astype(int)
 
 #todo: mark charging events that got transfered to retail-parking
+#todo: transfer multi-use events just from commercial street to retail
 
 def distribute_charging_events(
     locations: gpd.GeoDataFrame,
@@ -142,6 +143,11 @@ def distribute_charging_events(
         capacity = events.at[idx, "station_charging_capacity"]  # in kW
 
         if fill_existing_first:
+
+            if availability.size < 1:
+                print()
+            if start >= end:
+                print("HILFEEEEEEE")
             in_use = availability[:, start:end].max(axis=1)
             required = locations["charging_points"].values
             free_mask = in_use < required
@@ -215,7 +221,7 @@ def distribute_charging_events_fill_existing_only(
     availability = availability_mask.copy()
 
     print("Distributing charging events (only to existing charging points)...")
-
+    counter_redistributed_events = 0
     for idx in range(n_events):
         start = events.at[idx, "event_start"]
         duration = events.at[idx, "event_time"]
@@ -227,15 +233,18 @@ def distribute_charging_events_fill_existing_only(
         # Assign event only to locations with available charging points
         if free_mask.any():
             assigned = np.argmax(free_mask)  # Assign to first free location
-            print("!!! free lp available")
+            #print("!!! free lp available")
+            counter_redistributed_events += 1
         else:
             # No more available charging points
-            print(f"Event {idx} could not be assigned to any location (no available charging points).")
+            #print(f"Event {idx} could not be assigned to any location (no available charging points).")
             continue  # Skip this event as it cannot be assigned
 
         # Assign the event to the location
         availability[assigned, start:end] += 1
         assigned_locations[idx] = locations.index[assigned]
+
+    print("transfered multi-use charging events:", counter_redistributed_events)
 
     # Mark locations with assigned events
     events = events.copy()
