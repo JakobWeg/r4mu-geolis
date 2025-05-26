@@ -104,6 +104,7 @@ def distribute_charging_events(
     rng: np.random.Generator = None,
     fill_existing_only: bool = False,  # New behavior
     availability_mask: np.array = None,
+    flexibility_multi_use: int = 0,
     return_mask: bool = False
 ):
     """
@@ -115,7 +116,7 @@ def distribute_charging_events(
     if fill_existing_only:
         print("Using the 'fill_existing_only' method: Only existing charging points will be filled.")
         return distribute_charging_events_fill_existing_only(
-            locations, events, weight_column, simulation_steps, rng, availability_mask
+            locations, events, weight_column, simulation_steps, flexibility_multi_use, rng, availability_mask
         )
 
     n_locations = len(locations)
@@ -147,7 +148,7 @@ def distribute_charging_events(
             if availability.size < 1:
                 print()
             if start >= end:
-                print("HILFEEEEEEE")
+                print("Fehler bei übergebener Maske zur Übertragung von Ladeevents")
             in_use = availability[:, start:end].max(axis=1)
             required = locations["charging_points"].values
             free_mask = in_use < required
@@ -191,12 +192,87 @@ def distribute_charging_events(
     else:
         return locations, events
 
-
 def distribute_charging_events_fill_existing_only(
     locations: gpd.GeoDataFrame,
     events: pd.DataFrame,
     weight_column: str,
     simulation_steps: int,
+    max_shift_steps: int = 0,
+    rng: np.random.Generator = None,
+    availability_mask: np.array = None
+):
+    """
+    Distributes charging events to existing locations with available charging points.
+    Does not add new charging points. If all charging points are filled, no further charging events are assigned.
+    Allows rescheduling events by up to `max_shift_steps` time steps if no immediate availability is found.
+    """
+
+    n_locations = len(locations)
+    n_events = len(events)
+
+    # Normalize weights
+    probabilities = locations[weight_column].values / locations[weight_column].sum()
+
+    # Initial setup
+    locations = locations.reset_index().copy()
+    locations["charging_points"] = locations["charging_points"].astype(int)  # Ensure the column is integer
+    assigned_locations = np.full(n_events, np.nan)
+
+    # Availability matrix: rows=locations, cols=timesteps
+    availability = availability_mask.copy()
+
+    print("Distributing charging events (only to existing charging points)...")
+    counter_redistributed_events = 0
+    for idx in range(n_events):
+        original_start = events.at[idx, "event_start"]
+        base_duration = events.at[idx, "event_time"]
+        energy = events.at[idx, "energy"]
+        capacity = events.at[idx, "station_charging_capacity"]  # in kW
+
+        assigned = None
+        for shift in range(0, max_shift_steps + 1):
+            start = original_start + shift
+
+            # Berechne neue Dauer je nach verbleibender Zeit
+            if base_duration - shift < energy / capacity * 4:
+                duration = min(math.ceil(energy / capacity * 4), base_duration)
+            else:
+                duration = base_duration - shift
+
+            end = start + duration
+
+            if end > simulation_steps:
+                continue  # Don't assign if end exceeds simulation time
+
+            free_mask = availability[:, start:end].sum(axis=1) < locations["charging_points"].values
+            if free_mask.any():
+                assigned = np.argmax(free_mask)
+                counter_redistributed_events += 1
+                break  # Exit the shift loop once assigned
+
+        if assigned is not None:
+            availability[assigned, start:end] += 1
+            assigned_locations[idx] = locations.index[assigned]
+        # else: Event bleibt unzugewiesen
+
+    print(f"Total redistributed events: {counter_redistributed_events}")
+
+    print("transfered multi-use charging events:", counter_redistributed_events)
+
+    # Mark locations with assigned events
+    events = events.copy()
+    events["assigned_location"] = assigned_locations
+
+    #return assigned_locations, events
+    return locations, events
+
+
+def distribute_charging_events_fill_existing_only_old(
+    locations: gpd.GeoDataFrame,
+    events: pd.DataFrame,
+    weight_column: str,
+    simulation_steps: int,
+    max_shift_steps: int = 8,
     rng: np.random.Generator = None,
     availability_mask: np.array = None
 ):
@@ -204,6 +280,8 @@ def distribute_charging_events_fill_existing_only(
     Distributes charging events to existing locations with available charging points.
     Does not add new charging points. If all charging points are filled, no further charging events are assigned.
     """
+
+    szenario_time_reschedule = True
 
     n_locations = len(locations)
     n_events = len(events)
@@ -236,9 +314,39 @@ def distribute_charging_events_fill_existing_only(
             #print("!!! free lp available")
             counter_redistributed_events += 1
         else:
-            # No more available charging points
-            #print(f"Event {idx} could not be assigned to any location (no available charging points).")
-            continue  # Skip this event as it cannot be assigned
+            if szenario_time_reschedule:
+                # todo jedes mal die Endzeit nicht verlängern, wenn der Zeitraum reicht um die Energie nachzuladen. In config
+                start = events.at[idx, "event_start"] + 4
+                capacity = events.at[idx, "station_charging_capacity"]  # in kW
+                if events.at[idx, "event_time"] - 4 < events.at[idx, "energy"]/capacity*4:
+                    duration = min(math.ceil(events.at[idx, "energy"]/capacity*4), events.at[idx, "event_time"])
+                else:
+                    duration = events.at[idx, "event_time"] - 4
+                end = start + duration
+                # Find locations with available charging points in the time range
+                free_mask = availability[:, start:end].sum(axis=1) < locations["charging_points"].values
+                if free_mask.any():
+                    assigned = np.argmax(free_mask)  # Assign to first free location
+                    # print("!!! free lp available")
+                    counter_redistributed_events += 1
+                else:
+                    start = events.at[idx, "event_start"] + 8
+                    capacity = events.at[idx, "station_charging_capacity"]  # in kW
+                    if events.at[idx, "event_time"] - 8 < events.at[idx, "energy"] / capacity * 4:
+                        duration = min(math.ceil(events.at[idx, "energy"] / capacity * 4), events.at[idx, "event_time"])
+                    else:
+                        duration = events.at[idx, "event_time"] - 8
+                    end = start + duration
+                    # Find locations with available charging points in the time range
+                    free_mask = availability[:, start:end].sum(axis=1) < locations["charging_points"].values
+                    if free_mask.any():
+                        assigned = np.argmax(free_mask)  # Assign to first free location
+                        # print("!!! free lp available")
+                        counter_redistributed_events += 1
+                    else:
+                        # No more available charging points
+                        #print(f"Event {idx} could not be assigned to any location (no available charging points).")
+                        continue  # Skip this event as it cannot be assigned
 
         # Assign the event to the location
         availability[assigned, start:end] += 1

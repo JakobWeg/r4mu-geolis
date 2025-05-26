@@ -12,6 +12,8 @@ import csv
 
 import use_case as uc
 import use_case_helpers
+import utility
+
 
 # todo Output einer Metadatei programmieren: Info zu Anzahl an Ladepunkten, installierter Leistung, Energie
 
@@ -67,6 +69,7 @@ def parse_data(args):
         'random_seed': rng,
         'mode': args.mode,
         'multi_use_concept': parser['basic'].getboolean('multi_use_concept', None),
+        'flexibility_multi_use': parser['basic'].getint('flexibility_multi_use', 0),
         'charge_events_private_path': parser.get('data', 'charging_events_private'),
         'charge_events_commercial_path': parser.get('data', 'charging_events_commercial'),
         'result_dir': result_dir,
@@ -77,8 +80,8 @@ def parse_data(args):
         hpc_pos_file = parser.get('data', 'hpc_positions')
         positions = gpd.read_file(pathlib.Path(data_dir, hpc_pos_file))
         config_dict["hpc_points"] = positions
-        if run_retail:
-            config_dict["hpc_share_retail"] = parser.getfloat("uc_params", "hpc_share_retail"),
+        # if run_retail:
+        #     config_dict["hpc_share_retail"] = parser.getfloat("uc_params", "hpc_share_retail"),
         print("--- parsing hpc data done ---")
 
     if run_public:
@@ -116,8 +119,8 @@ def parse_data(args):
         config_dict.update({
             "home_data_apartment": buildings_data_file_apartment,
             "home_data_detached": buildings_data_file_detached,
-            "share_home_detached": parser.getfloat('uc_params', 'share_lis_home_detached'),
-            "share_home_apartment": parser.getfloat('uc_params', 'share_lis_home_apartment')
+            "share_home_detached": parser.getfloat('uc_params', 'share_home_detached'),
+            "share_home_apartment": parser.getfloat('uc_params', 'share_home_apartment')
         })
         home_data_detached.to_file("data/home_data_detached.gpkg")
         home_data_apartment.to_file("data/home_data_apartment.gpkg")
@@ -282,7 +285,7 @@ def run_use_cases(data_dict):
         data_dict["results_summary"][uc_name] = {}
         if data_dict["multi_use_concept"]:
             data_dict["results_summary"][uc_name]["charging_points"], data_dict["results_summary"][uc_name]["energy"], \
-                data_dict["results_summary"][uc_name]["installed_power"], charging_locations_public_after_multi_use = (
+                data_dict["results_summary"][uc_name]["installed_power"], charging_events_public_after_multi_use = (
                 uc.retail(data_dict['retail_parking_lots'],
                     data_dict))
         else:
@@ -307,7 +310,7 @@ def run_use_cases(data_dict):
                 data_dict["results_summary"][uc_name]["installed_power"] = uc.public(data_dict['poi_data'],
                                                                                      data_dict['home_street_data'],
                                                                                      data_dict,
-                                                                                     charging_locations_public_after_multi_use=charging_locations_public_after_multi_use)
+                                                                                     charging_locations_public_after_multi_use=charging_events_public_after_multi_use)
         else:
             data_dict["results_summary"][uc_name]["charging_points"], data_dict["results_summary"][uc_name]["energy"], \
                 data_dict["results_summary"][uc_name]["installed_power"] = uc.public(data_dict['poi_data'],
@@ -331,8 +334,11 @@ def main():
 
     result_summary = run_use_cases(data)
 
+    if data["visual"]:
+        utility.plot_occupation_of_charging_points(result_summary)
+
     # save meta data
-    meta_data = {k: data.get(k) for k in ['charge_events_private_path', 'charge_events_commercial_path']}
+    meta_data = {k: data.get(k) for k in ['charge_events_private_path', 'charge_events_commercial_path', 'multi_use_concept', 'flexibility_multi_use', 'charging_time_limit', 'charging_time_limit_duration', 'charging_time_limit_start', 'charging_time_limit_end']}
 
     with open(os.path.join(data["result_dir"],'metadata.json'), 'w') as f:
         json.dump(meta_data, f)

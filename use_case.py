@@ -58,20 +58,13 @@ def hpc(hpc_data: gpd.GeoDataFrame, uc_dict, timestep=15):
         )
         located_charging_events_gdf.to_crs(3035)
 
-        # charging_locations_hpc.rename(columns={
-        #                                     'old_column1': 'new_column1',
-        #                                     'old_column2': 'new_column2'
-        #                                 })
-        # located_charging_events_gdf = located_charging_events_gdf.rename(columns={
-        #                                                                         'old_column1': 'new_column1',
-        #                                                                         'old_column2': 'new_column2'
-        #                                                                     })
-
         located_charging_events_gdf["location_id"] = uc_helpers.get_id(uc_id, located_charging_events_gdf["assigned_location"].astype(int))
         charging_locations_hpc["location_id"] = uc_helpers.get_id(uc_id, pd.Series(charging_locations_hpc.index).astype(int))
 
         charging_locations = charging_locations_hpc[uc_dict["columns_output_locations"]]
         located_charging_events_gdf = located_charging_events_gdf[uc_dict["columns_output_chargingevents"]]
+
+        charging_locations = charging_locations[charging_locations["charging_points"] != 0]
 
         utility.save(charging_locations, uc_id, "charging-locations", uc_dict)
         utility.save(located_charging_events_gdf, uc_id, "charging-events", uc_dict)
@@ -183,6 +176,7 @@ def public(
     charging_locations = charging_locations[uc_dict["columns_output_locations"]]
     located_charging_events_gdf = located_charging_events_gdf[uc_dict["columns_output_chargingevents"]]
 
+    charging_locations = charging_locations[charging_locations["charging_points"] != 0]
 
     utility.save(charging_locations, uc_id, "charging-locations", uc_dict)
     utility.save(located_charging_events_gdf, uc_id, "charging-events", uc_dict)
@@ -198,6 +192,8 @@ def home(home_data: gpd.GeoDataFrame, uc_dict, mode):
     # uc_id = "home"
     # print("Use case: " + uc_id)
 
+    in_region = home_data
+
     if mode == "apartment":
         uc_id = "home_apartment"
         print("Use case: " + uc_id)
@@ -208,6 +204,17 @@ def home(home_data: gpd.GeoDataFrame, uc_dict, mode):
             ]
             .reset_index()
         )
+        (
+            charging_locations_home,
+            located_charging_events,
+        ) = uc_helpers.distribute_charging_events(
+            in_region,
+            charging_events,
+            weight_column="households_total",
+            simulation_steps=2000, fill_existing_first=True,
+            rng=uc_dict["random_seed"]
+        )
+
     elif mode == "detached":
         uc_id = "home_detached"
         print("Use case: " + uc_id)
@@ -216,24 +223,19 @@ def home(home_data: gpd.GeoDataFrame, uc_dict, mode):
             .loc[uc_dict["charging_event"]["charging_use_case"].isin(["home_detached"])]
             .reset_index()
         )
+        (
+            charging_locations_home,
+            located_charging_events,
+        ) = uc_helpers.distribute_charging_events(
+            in_region,
+            charging_events,
+            weight_column="households_total",
+            simulation_steps=2000, fill_existing_first=False,
+            rng=uc_dict["random_seed"]
+        )
+
     else:
         print("wrong mode")
-
-    # filter houses by region
-    # in_region_bool = home_data["geometry"].within(uc_dict["boundaries"].iloc[0,0])
-    # in_region = home_data.loc[in_region_bool].copy()
-    in_region = home_data
-    # in_region = in_region.iloc[:800]
-    (
-        charging_locations_home,
-        located_charging_events,
-    ) = uc_helpers.distribute_charging_events(
-        in_region,
-        charging_events,
-        weight_column="households_total",
-        simulation_steps=2000, fill_existing_first=False,
-        rng=uc_dict["random_seed"]
-    )
 
     # Merge Chargin_events and Locations
     charging_locations_home["index"] = charging_locations_home.index
@@ -255,6 +257,8 @@ def home(home_data: gpd.GeoDataFrame, uc_dict, mode):
     charging_locations = charging_locations_home[uc_dict["columns_output_locations"]]
 
     located_charging_events_gdf = located_charging_events_gdf[uc_dict["columns_output_chargingevents"]]
+
+    charging_locations = charging_locations[charging_locations["charging_points"] != 0]
 
     utility.save(charging_locations, uc_id, "charging-locations", uc_dict)
     utility.save(located_charging_events_gdf, uc_id, "charging-events", uc_dict)
@@ -307,6 +311,8 @@ def work(work_data, uc_dict, timestep=15):
 
     charging_locations = charging_locations_work[uc_dict["columns_output_locations"]]
     located_charging_events_gdf = located_charging_events_gdf[uc_dict["columns_output_chargingevents"]]
+
+    charging_locations = charging_locations[charging_locations["charging_points"] != 0]
 
     utility.save(charging_locations, uc_id, "charging-locations", uc_dict)
     utility.save(located_charging_events_gdf, uc_id, "charging-events", uc_dict)
@@ -378,36 +384,11 @@ def retail(retail_data: gpd.GeoDataFrame, uc_dict):
         ]
         charging_events_public = charging_events_street.reset_index()
 
-        # # Definiere den Zeitrahmen für Mo-Sa zwischen 21:00 und 8:00 Uhr über fortlaufende Zeitschritte
-        # # Jeder Tag hat 96 Zeitschritte, daher ist der Zeitrahmen für 21:00 bis 8:00 Uhr folgender:
-        # night_time_start = 80  # 21:00 Uhr (Zeitschritt 84)
-        # night_time_end = 35  # 8:00 Uhr des nächsten Tages (Zeitschritt 31)
-        #
-        # depot_night_events = []
-        #
-        # # Überprüfe für jedes Ladeevent, ob es im Zeitrahmen zwischen 21:00 und 8:00 Uhr liegt
-        # for index, event in charging_events_depot.iterrows():
-        #     start = event['event_start']
-        #     dauer = event['event_time']
-        #     ende = start + dauer
-        #
-        #     # Berechne den Tag (von 0 bis 6, Montag bis Sonntag) und den Zeitschritt innerhalb des Tages
-        #     day_of_week = start // 96  # Tag des Events (0=Montag, 6=Sonntag)
-        #     time_of_day = start % 96  # Zeitschritt innerhalb des Tages (0-95)
-        #     end_of_event = ende % 96
-        #     end_of_event_week = ende // 96
-        #     # Prüfe, ob das Ladeevent im Zeitraum zwischen 21:00 Uhr und 8:00 Uhr liegt
-        #     if ((time_of_day >= night_time_start) or (time_of_day < night_time_end)) and ((end_of_event <= night_time_end)
-        #             and (end_of_event_week <= (day_of_week+2))):
-        #         depot_night_events.append(event)
-        #
-        # # Wir haben nun alle Depot-Ladeevents im gewünschten Zeitraum gesammelt
-        # depot_night_events = pd.DataFrame(depot_night_events)
-
         # Verteilung der Depot-Ladeevents auf Retail-Standorte
         charging_locations_retail_after_multi_use, located_public_events = uc_helpers.distribute_charging_events(
             charging_locations_retail, charging_events_public, weight_column="area", simulation_steps=2000,
-            rng=uc_dict["random_seed"], fill_existing_only=True, availability_mask=availability_mask
+            rng=uc_dict["random_seed"], fill_existing_only=True, availability_mask=availability_mask,
+            flexibility_multi_use=uc_dict["flexibility_multi_use"]
         ) # charging_events_depot austauschen gegen depot_night_events
 
         located_public_events_assigned = located_public_events[located_public_events["assigned_location"].notna()]
@@ -440,8 +421,12 @@ def retail(retail_data: gpd.GeoDataFrame, uc_dict):
     # todo checken o alle ids stimmen (bei multi-use-szenario)
     # todo hier alle charging locations mit nr. ladepunkte gleich null raus nehmen
 
+    charging_locations = charging_locations[charging_locations["charging_points"] != 0]
+
     utility.save(charging_locations, uc_id, "charging-locations", uc_dict)
     utility.save(located_charging_events_gdf, uc_id, "charging-events", uc_dict)
+
+    utility.plot_occupation_of_charging_points(located_charging_events, uc_id)
 
     print(uc_id, "Anzahl der Ladepunkte: ", charging_locations["charging_points"].sum())
     print("distribution of work-charging-points successful")
@@ -492,6 +477,8 @@ def depot(depot_data: gpd.GeoDataFrame, uc_dict):
 
     charging_locations = charging_locations_depot[uc_dict["columns_output_locations"]]
     located_charging_events_gdf = located_charging_events_gdf[uc_dict["columns_output_chargingevents"]]
+
+    charging_locations = charging_locations[charging_locations["charging_points"] != 0]
 
     utility.save(charging_locations, uc_id, "charging-locations", uc_dict)
     utility.save(located_charging_events_gdf, uc_id, "charging-events", uc_dict)
