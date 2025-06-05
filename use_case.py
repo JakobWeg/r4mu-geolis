@@ -71,16 +71,16 @@ def hpc(hpc_data: gpd.GeoDataFrame, uc_dict, timestep=15):
 
         print(uc_id, "Anzahl der Ladepunkte: ", charging_locations["charging_points"].sum())
         print("distribution of hpc-charging-points successful")
-        return (charging_locations["charging_points"].sum(), int(charging_events["energy"].sum()),
-                (charging_locations["average_charging_capacity"] * charging_locations["charging_points"]).sum())
+        return (int(charging_locations["charging_points"].sum()), int(charging_events["energy"].sum()),
+                int((charging_locations["average_charging_capacity"] * charging_locations["charging_points"]).sum()))
     else:
         print("No hpc charging in timeseries")
         return 0, 0, 0
 
 
 def public(
-    public_data_home_street: gpd.GeoDataFrame,
     public_data_not_home_street: gpd.GeoDataFrame,
+    public_data_home_street: gpd.GeoDataFrame,
     uc_dict,
     charging_locations_public_after_multi_use: pd.DataFrame = None,
 ):
@@ -107,55 +107,83 @@ def public(
     else:
         charging_events = charging_events_public.reset_index()
 
-    # charging_events_home_street = charging_events.loc[
-    #     charging_events["location"] == "home"
-    # ].reset_index()
-    # charging_events_not_home_street = charging_events.loc[
-    #     charging_events["location"] != "home"
-    # ].reset_index()
-    # in_region_home_street = public_data_home_street
+    # charging_events = charging_events.iloc[:1000]
+
+    charging_events_home_street = charging_events.loc[
+        charging_events["location"] == "home"
+    ].reset_index(drop=True)
+    charging_events_not_home_street = charging_events.loc[
+        charging_events["location"] != "home"
+    ].reset_index(drop=True)
+    in_region_home_street = public_data_home_street
+
     in_region_not_home_street = public_data_not_home_street
 
+    if in_region_home_street is not None:
+        # todo: die beiden Datensätze zusammenführen. Alternative: Getrennte berechnung von home street und public street -> Zusammenführung von Ladepunkten, die in einem Umkreis von bsp. 150 m liegen
+        # todo: Alternative: Wenn neuer Ladepunkt hinzugefügt werden soll, dann über zuordnung home street oder not home street. Zuerst werden aber alle LP die existieren verwendet werden home street & not home street
 
-    # (
-    #     charging_locations_public_home,
-    #     located_charging_events_public_home,
-    # ) = uc_helpers.distribute_charging_events(
-    #     in_region_home_street,
-    #     charging_events_home_street,
-    #     weight_column="potential",
-    #     simulation_steps=1000,
-    # )
+        in_region_home_street = in_region_home_street.rename(columns={'households_total': 'total_weight'})
+        in_region_not_home_street = in_region_not_home_street.rename(columns={'@id': 'id'})
+        in_region_home_street = in_region_home_street[["total_weight", "geometry"]]
+        in_region_not_home_street = in_region_not_home_street[["total_weight", "geometry"]]
+        in_region_home_street["mode"] = "home_street"
+        in_region_not_home_street["mode"] = "not_home_street"
+
+
+
+        in_region = pd.concat([in_region_home_street, in_region_not_home_street], ignore_index=True)
+
+    else:
+        in_region = in_region_not_home_street
+
+    (
+        charging_locations_public_home,
+        located_charging_events_public_home,
+    ) = uc_helpers.distribute_charging_events(
+        in_region[in_region["mode"] == "home_street"],
+        charging_events_home_street,
+        weight_column="total_weight",
+        simulation_steps=2000,
+        rng=uc_dict["random_seed"],
+    )
+    charging_locations_public_home["mode"] = "home_street"
+    located_charging_events_public_home["mode"] = "home_street"
 
     (
         charging_locations_public,
         located_charging_events_public,
     ) = uc_helpers.distribute_charging_events(
-        in_region_not_home_street,
-        charging_events,
+        in_region[in_region["mode"] == "not_home_street"],
+        charging_events_not_home_street,
         weight_column="total_weight",
         simulation_steps=2000,
-        rng=uc_dict["random_seed"]
+        rng=uc_dict["random_seed"],
+        #home_street=uc_dict["run_home"]
     )
+
+    charging_locations_public["mode"] = "street"
+    located_charging_events_public["mode"] = "street"
 
     # todo: datensatz für public home anpassen
 
-    # located_charging_events_public_home[
-    #     "assigned_location"
-    # ] = located_charging_events_public_home["assigned_location"] + len(
-    #     charging_locations_public
-    # )
+    located_charging_events_public_home[
+        "assigned_location"
+    ] = located_charging_events_public_home["assigned_location"] + len(
+        charging_locations_public
+    )
 
     # concat charging events and location at home and public
-    # charging_locations = pd.concat(
-    #     [charging_locations_public, charging_locations_public_home], ignore_index=True
-    # )
-    # located_charging_events = pd.concat(
-    #     [located_charging_events_public, located_charging_events_public_home],
-    #     ignore_index=True,
-    # )
-    charging_locations = charging_locations_public
-    located_charging_events = located_charging_events_public
+    charging_locations = pd.concat(
+        [charging_locations_public, charging_locations_public_home], ignore_index=True
+    )
+    located_charging_events = pd.concat(
+        [located_charging_events_public, located_charging_events_public_home],
+        ignore_index=True,
+    )
+
+    # charging_locations = charging_locations_public
+    # located_charging_events = located_charging_events_public
 
     # Merge Chargin_events and Locations
     charging_locations["index"] = charging_locations.index
@@ -173,8 +201,23 @@ def public(
         "assigned_location"].astype(int))
     charging_locations["location_id"] = uc_helpers.get_id(uc_id, pd.Series(charging_locations.index).astype(int))
 
-    charging_locations = charging_locations[uc_dict["columns_output_locations"]]
-    located_charging_events_gdf = located_charging_events_gdf[uc_dict["columns_output_chargingevents"]]
+    columns_locations = uc_dict["columns_output_locations"].copy()
+    columns_locations.append("mode")
+
+    columns_events = uc_dict["columns_output_chargingevents"].copy()
+    columns_events.append("mode")
+
+    charging_locations = charging_locations[columns_locations]
+    located_charging_events_gdf = located_charging_events_gdf.rename(columns={"mode_x": "mode"})
+    located_charging_events_gdf = located_charging_events_gdf[columns_events]
+
+    charging_locations = charging_locations[charging_locations["charging_points"] != 0]
+
+    # todo postprocessing of locations:
+    postprocessing = True
+    if postprocessing:
+        charging_locations, located_charging_events = uc_helpers.postprocess_public_demands(charging_locations,
+        located_charging_events_gdf)
 
     charging_locations = charging_locations[charging_locations["charging_points"] != 0]
 
@@ -183,9 +226,8 @@ def public(
 
     print(uc_id, "Anzahl der Ladepunkte: ", charging_locations["charging_points"].sum())
     print("distribution of public-charging-points successful")
-    return (charging_locations["charging_points"].sum(), int(charging_events["energy"].sum()),
-            (charging_locations["average_charging_capacity"]*charging_locations["charging_points"]).sum())
-
+    return (int(charging_locations["charging_points"].sum()), int(charging_events["energy"].sum()),
+            int((charging_locations["average_charging_capacity"]*charging_locations["charging_points"]).sum()))
 
 def home(home_data: gpd.GeoDataFrame, uc_dict, mode):
     # todo: add probability for charging infrastructure at home. Select homes that are not possible to be electrified
@@ -204,6 +246,7 @@ def home(home_data: gpd.GeoDataFrame, uc_dict, mode):
             ]
             .reset_index()
         )
+        # charging_events = charging_events.iloc[:500]
         (
             charging_locations_home,
             located_charging_events,
@@ -223,6 +266,7 @@ def home(home_data: gpd.GeoDataFrame, uc_dict, mode):
             .loc[uc_dict["charging_event"]["charging_use_case"].isin(["home_detached"])]
             .reset_index()
         )
+        # charging_events = charging_events.iloc[:500]
         (
             charging_locations_home,
             located_charging_events,
@@ -265,8 +309,8 @@ def home(home_data: gpd.GeoDataFrame, uc_dict, mode):
 
     print(uc_id, "Anzahl der Ladepunkte: ", charging_locations["charging_points"].sum())
     print("distribution of home-charging-points successful")
-    return (charging_locations["charging_points"].sum(), int(charging_events["energy"].sum()),
-            (charging_locations["average_charging_capacity"]*charging_locations["charging_points"]).sum())
+    return (int(charging_locations["charging_points"].sum()), int(charging_events["energy"].sum()),
+            int((charging_locations["average_charging_capacity"]*charging_locations["charging_points"]).sum()))
 
 def work(work_data, uc_dict, timestep=15):
     print("distributing uc work...")
@@ -319,8 +363,8 @@ def work(work_data, uc_dict, timestep=15):
 
     print(uc_id, "Anzahl der Ladepunkte: ", charging_locations["charging_points"].sum())
     print("distribution of work-charging-points successful")
-    return (charging_locations["charging_points"].sum(), int(charging_events["energy"].sum()),
-            (charging_locations["average_charging_capacity"]*charging_locations["charging_points"]).sum())
+    return (int(charging_locations["charging_points"].sum()), int(charging_events["energy"].sum()),
+            int((charging_locations["average_charging_capacity"]*charging_locations["charging_points"]).sum()))
 
 def retail(retail_data: gpd.GeoDataFrame, uc_dict):
     """
@@ -426,18 +470,18 @@ def retail(retail_data: gpd.GeoDataFrame, uc_dict):
     utility.save(charging_locations, uc_id, "charging-locations", uc_dict)
     utility.save(located_charging_events_gdf, uc_id, "charging-events", uc_dict)
 
-    utility.plot_occupation_of_charging_points(located_charging_events, uc_id)
+    # utility.plot_occupation_of_charging_points(located_charging_events, uc_id)
 
     print(uc_id, "Anzahl der Ladepunkte: ", charging_locations["charging_points"].sum())
     print("distribution of work-charging-points successful")
 
     if uc_dict["multi_use_concept"]:
-        return (charging_locations["charging_points"].sum(), int(located_charging_events["energy"].sum()),
-                (charging_locations["average_charging_capacity"]*charging_locations["charging_points"]).sum(),
+        return (int(charging_locations["charging_points"].sum()), int(located_charging_events["energy"].sum()),
+                int((charging_locations["average_charging_capacity"]*charging_locations["charging_points"]).sum()),
                 charging_events_public_no_multi_use_possible)
     else:
-        return (charging_locations["charging_points"].sum(), int(located_charging_events["energy"].sum()),
-                (charging_locations["average_charging_capacity"]*charging_locations["charging_points"]).sum())
+        return (int(charging_locations["charging_points"].sum()), int(located_charging_events["energy"].sum()),
+                int((charging_locations["average_charging_capacity"]*charging_locations["charging_points"]).sum()))
 
 def depot(depot_data: gpd.GeoDataFrame, uc_dict):
     uc_id = "depot"
@@ -485,5 +529,5 @@ def depot(depot_data: gpd.GeoDataFrame, uc_dict):
 
     print(uc_id, "Anzahl der Ladepunkte: ", charging_locations["charging_points"].sum())
     print("distribution of depot-charging-points successful")
-    return (charging_locations["charging_points"].sum(), int(located_charging_events["energy"].sum()),
-            (charging_locations["average_charging_capacity"]*charging_locations["charging_points"]).sum())
+    return (int(charging_locations["charging_points"].sum()), int(located_charging_events["energy"].sum()),
+            int((charging_locations["average_charging_capacity"]*charging_locations["charging_points"]).sum()))

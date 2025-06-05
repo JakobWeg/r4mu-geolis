@@ -84,19 +84,7 @@ def parse_data(args):
         #     config_dict["hpc_share_retail"] = parser.getfloat("uc_params", "hpc_share_retail"),
         print("--- parsing hpc data done ---")
 
-    if run_public:
-        public_data_file = parser.get('data', 'public_poi')
-        public_data = gpd.read_file(pathlib.Path(data_dir, public_data_file))
-
-        public_home_street_data_file = parser.get('data', 'public_home_street')
-        public_home_street_data = gpd.read_file(pathlib.Path(data_dir, public_home_street_data_file))
-
-        config_dict.update({'poi_data': public_data,
-                            'home_street_data': public_home_street_data,
-                            })
-        print("--- parsing public data done ---")
-
-    if run_home:
+    if run_home or run_public:
         buildings_data_file = parser.get('data', 'building_data')
         demand_profiles_data = parser.get('data', 'home_demand_profiles')
 
@@ -124,6 +112,19 @@ def parse_data(args):
         })
         home_data_detached.to_file("data/home_data_detached.gpkg")
         home_data_apartment.to_file("data/home_data_apartment.gpkg")
+
+    if run_public:
+        public_data_file = parser.get('data', 'public_poi')
+        public_data = gpd.read_file(pathlib.Path(data_dir, public_data_file))
+        public_data = public_data.to_crs(3035)
+
+
+        public_home_street_data = home_data_apartment
+
+        config_dict.update({'poi_data': public_data,
+                            'home_street_data': public_home_street_data,
+                            })
+        print("--- parsing public data done ---")
 
     if run_work:
         work_retail = float(parser.get('uc_params', 'work_weight_retail'))
@@ -255,11 +256,6 @@ def parse_potential_data(args):
 
 
 def run_use_cases(data_dict):
-    if data_dict['run_hpc']:
-        uc_name = "hpc"
-        data_dict["results_summary"][uc_name] = {}
-        data_dict["results_summary"][uc_name]["charging_points"], data_dict["results_summary"][uc_name]["energy"], \
-            data_dict["results_summary"][uc_name]["installed_power"] = uc.hpc(data_dict['hpc_points'], data_dict)
 
     if data_dict['run_home']:
         uc_name = "home_detached"
@@ -280,6 +276,12 @@ def run_use_cases(data_dict):
             data_dict["results_summary"][uc_name]["installed_power"] = uc.work(data_dict[uc_name],
                 data_dict)
 
+    if data_dict['run_hpc']:
+        uc_name = "hpc"
+        data_dict["results_summary"][uc_name] = {}
+        data_dict["results_summary"][uc_name]["charging_points"], data_dict["results_summary"][uc_name]["energy"], \
+            data_dict["results_summary"][uc_name]["installed_power"] = uc.hpc(data_dict['hpc_points'], data_dict)
+
     if data_dict['run_retail']:
         uc_name = "retail"
         data_dict["results_summary"][uc_name] = {}
@@ -292,14 +294,6 @@ def run_use_cases(data_dict):
             data_dict["results_summary"][uc_name]["charging_points"], data_dict["results_summary"][uc_name]["energy"], \
                 data_dict["results_summary"][uc_name]["installed_power"] = uc.retail(data_dict['retail_parking_lots'],
                     data_dict)
-
-    if data_dict['run_depot']:
-        uc_name = "depot"
-        data_dict["results_summary"][uc_name] = {}
-
-        data_dict["results_summary"][uc_name]["charging_points"], data_dict["results_summary"][uc_name]["energy"], \
-        data_dict["results_summary"][uc_name]["installed_power"] = uc.depot(data_dict[uc_name],
-                data_dict)
 
     if data_dict['run_public']:
         uc_name = "public"
@@ -316,6 +310,14 @@ def run_use_cases(data_dict):
                 data_dict["results_summary"][uc_name]["installed_power"] = uc.public(data_dict['poi_data'],
                                                                                      data_dict['home_street_data'],
                                                                                      data_dict)
+
+    if data_dict['run_depot']:
+        uc_name = "depot"
+        data_dict["results_summary"][uc_name] = {}
+
+        data_dict["results_summary"][uc_name]["charging_points"], data_dict["results_summary"][uc_name]["energy"], \
+        data_dict["results_summary"][uc_name]["installed_power"] = uc.depot(data_dict[uc_name],
+                data_dict)
 
     return data_dict["results_summary"]
 
@@ -335,7 +337,8 @@ def main():
     result_summary = run_use_cases(data)
 
     if data["visual"]:
-        utility.plot_occupation_of_charging_points(result_summary)
+        print("--- starting visualisation ---")
+        # utility.plot_occupation_of_charging_points(result_summary)
 
     # save meta data
     meta_data = {k: data.get(k) for k in ['charge_events_private_path', 'charge_events_commercial_path', 'multi_use_concept', 'flexibility_multi_use', 'charging_time_limit', 'charging_time_limit_duration', 'charging_time_limit_start', 'charging_time_limit_end']}

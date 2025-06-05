@@ -4,8 +4,124 @@ import pandas as pd
 import geopandas as gpd
 import numpy as np
 import math
-import use_case_helpers as uc_helpers
 
+def postprocess_public_demands(charging_locations: gpd.GeoDataFrame, located_charging_events: gpd.GeoDataFrame):
+
+    print("--- postprocessing of public demands started... ---")
+
+    max_distance = 1000 # Meter
+
+    # Filter street locations und home_street Events
+    street_locations = charging_locations[charging_locations["mode"] == "street"].copy()
+    home_events = located_charging_events[located_charging_events["mode"] == "home_street"].copy()
+    street_events = located_charging_events[located_charging_events["mode"] == "street"].copy()
+
+    # Maximaler Zeitschritt (für Maskenlänge)
+    max_step = max(located_charging_events["event_start"].max(), (located_charging_events["event_start"]+located_charging_events["event_time"]).max())
+
+    # Belegungs-Maske: location_id -> np.array (Zeitschritte)
+    occupancy_mask = {}
+    for loc_id in charging_locations["location_id"]:
+        occupancy_mask[loc_id] = np.zeros(max_step + 1, dtype=int)
+
+    # Maske mit bestehenden street Events füllen
+    for _, event in located_charging_events.iterrows():
+        loc_id = event["location_id"]
+        mode = event["mode"]
+        start = event["event_start"]
+        end = event["event_start"]+event["event_time"]
+        if loc_id in occupancy_mask:
+            occupancy_mask[loc_id][start:end] += 1
+
+    # Räumlicher Index für street locations
+    street_locations_sindex = street_locations.sindex
+
+    umverteilte_events = 0
+    zugeschlagene_punkte = 0
+
+    for idx, event in located_charging_events.iterrows():
+
+        if event["mode"] == "home_street":
+            event_point = event.geometry
+            start = event["event_start"]
+            end = event["event_start"]+event["event_time"]
+            old_location_id = event["location_id"]
+
+            # Kandidaten in 500m suchen
+            candidate_idx = list(street_locations_sindex.intersection(event_point.buffer(max_distance).bounds))
+            candidate_locs = street_locations.iloc[candidate_idx]
+            candidate_locs = candidate_locs[candidate_locs.geometry.distance(event_point) <= max_distance]
+
+            if candidate_locs.empty:
+                continue  # Kein Standort in Reichweite
+
+            # Prüfe freie Kapazität in Maske
+            loc_with_free_capacity = None
+            for _, loc in candidate_locs.iterrows():
+                loc_id = loc["location_id"]
+                charging_points = loc["charging_points"]
+                occupancy = occupancy_mask[loc_id][start:end]
+
+                if np.all(occupancy < charging_points):
+                    loc_with_free_capacity = loc
+                    break
+
+            if loc_with_free_capacity is not None:
+                new_location_id = loc_with_free_capacity["location_id"]
+            # else:
+                # Kein freier Punkt: nächstgelegenen Standort wählen, Ladepunkt hinzufügen
+                # candidate_locs["dist"] = candidate_locs.geometry.distance(event_point)
+                # nearest_loc = candidate_locs.sort_values("dist").iloc[0]
+                # new_location_id = nearest_loc["location_id"]
+                #
+                # charging_locations.loc[
+                #     charging_locations["location_id"] == new_location_id, "charging_points"
+                # ] += 1
+                #
+                # zugeschlagene_punkte += 1
+
+                # if new_location_id not in occupancy_mask:
+                #     occupancy_mask[new_location_id] = np.zeros(max_step + 1, dtype=int)
+
+                # Ladevent umverteilen
+                located_charging_events.at[idx, "location_id"] = new_location_id
+                located_charging_events.at[idx, "mode"] = "street"
+
+                # Maske updaten
+                # Abziehen der belegten Zeitschritte von der ursprünglichen home_street Location
+                occupancy_mask[old_location_id][start:end] -= 1
+
+                # Hinzufügen der belegten Zeitschritte zu der neuen location_id
+                occupancy_mask[new_location_id][start:end] += 1
+
+                umverteilte_events += 1
+
+    print(f"Anzahl umverteilter Ladeevents von 'home_street' auf 'street': {umverteilte_events}")
+    print(f"Anzahl neu hinzugefügter Ladepunkte an street-Standorten: {zugeschlagene_punkte}")
+
+    # Berechnung der maximalen gleichzeitigen Belegung je Location
+    max_concurrent_demand = {}
+    for loc_id in occupancy_mask:
+        # Maximale Belegung für die Location berechnen (maximale Anzahl von Ladeevents zu einem Zeitpunkt)
+        max_concurrent_demand[loc_id] = occupancy_mask[loc_id].max()
+
+        # Vergleiche maximale Belegung mit Ladepunkten der Location
+        current_charging_points = charging_locations.loc[charging_locations["location_id"] == loc_id, "charging_points"].values[0]
+        if max_concurrent_demand[loc_id] > current_charging_points:
+            # Wenn mehr Ladeevents gleichzeitig laufen, als Ladepunkte vorhanden sind, erhöhen wir die Ladepunkte
+            required_points = max_concurrent_demand[loc_id] - current_charging_points
+            charging_locations.loc[charging_locations["location_id"] == loc_id, "charging_points"] += required_points
+
+
+            # Auch in der Belegungsmaske für diese Location die Ladepunkte erhöhen
+            zugeschlagene_punkte += required_points
+        elif max_concurrent_demand[loc_id] < current_charging_points:
+            # Wenn weniger Ladeevents gleichzeitig belegt sind als Ladepunkte verfügbar, reduzieren wir die Ladepunkte
+            charging_locations.loc[charging_locations["location_id"] == loc_id, "charging_points"] = max_concurrent_demand[
+                loc_id]
+    print(f"Maximale gleichzeitige Belegung für jede Location berechnet.")
+
+    return charging_locations, located_charging_events
 
 def park_time_limitation(charging_events, data_dict, charging_use_case):
     print("limit parking time")
@@ -102,6 +218,7 @@ def distribute_charging_events(
     simulation_steps: int,
     fill_existing_first: bool = True,  # Old behavior
     rng: np.random.Generator = None,
+    #home_street: bool = False,
     fill_existing_only: bool = False,  # New behavior
     availability_mask: np.array = None,
     flexibility_multi_use: int = 0,
@@ -119,6 +236,11 @@ def distribute_charging_events(
             locations, events, weight_column, simulation_steps, flexibility_multi_use, rng, availability_mask
         )
 
+    # if home_street:
+    #     n_locations_home_street = len(locations[locations["mode"]== "home_street"])
+    #     n_locations_not_home_street = len(locations[locations["mode"]== "not_home_street"])
+    #
+    # else:
     n_locations = len(locations)
     n_events = len(events)
 
@@ -133,6 +255,10 @@ def distribute_charging_events(
 
     # Create availability matrix: rows=locations, cols=timesteps
     # todo: exchange locations with availability_mask, hier gibt es ein Problem mit dem index aus der availability und dem index des DataFrames, Abgl
+    # if home_street:
+    #     availability_home_street = np.zeros((n_locations_home_street, simulation_steps), dtype=int)
+    #     availability_not_home_street = np.zeros((n_locations_not_home_street, simulation_steps), dtype=int)
+    # else:
     availability = np.zeros((n_locations, simulation_steps), dtype=int)
 
     print("Distributing charging events...")
@@ -142,6 +268,7 @@ def distribute_charging_events(
         duration = events.at[idx, "event_time"]
         end = start + duration
         capacity = events.at[idx, "station_charging_capacity"]  # in kW
+        # if events.at[idx, "charging_use_case"] == "public" and events.at[idx, "location"] == "home":
 
         if fill_existing_first:
 
