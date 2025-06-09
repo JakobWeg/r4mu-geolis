@@ -493,12 +493,12 @@ def depot(depot_data: gpd.GeoDataFrame, uc_dict):
     charging_events = charging_events_depot.reset_index()
 
     in_region = depot_data
-    in_region = in_region.loc[in_region["area_ha"] > 0.1]
+    in_region = in_region.loc[in_region["area"] > 1]
     (
         charging_locations_depot,
         located_charging_events,
     ) = uc_helpers.distribute_charging_events(
-        in_region, charging_events, weight_column="area_ha", simulation_steps=2000,
+        in_region, charging_events, weight_column="area", simulation_steps=2000,
         rng=uc_dict["random_seed"]
     )
 
@@ -512,7 +512,7 @@ def depot(depot_data: gpd.GeoDataFrame, uc_dict):
     located_charging_events_gdf = gpd.GeoDataFrame(
         located_charging_events, geometry="geometry"
     )
-    located_charging_events_gdf.set_crs(3035)
+    located_charging_events_gdf.set_crs(3035, allow_override=True)
 
     # generate_ids and reduce columns
     located_charging_events_gdf["location_id"] = uc_helpers.get_id(uc_id, located_charging_events_gdf[
