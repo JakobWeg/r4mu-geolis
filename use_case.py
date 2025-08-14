@@ -95,14 +95,17 @@ def public(
     if uc_dict["multi_use_concept"]:
         print("multi-use-consepts activated")
 
-        charging_events_commerical = charging_locations_public_after_multi_use.reset_index(drop=True)
+        if uc_dict["multi_use_group"] == ['Private', 'Commercial']:
+            charging_events = charging_locations_public_after_multi_use
+        else:
+            charging_events_commerical = charging_locations_public_after_multi_use.reset_index(drop=True)
 
-        charging_events_private = uc_dict["charging_event"].loc[
-            uc_dict["charging_event"]["charging_use_case"].isin(["street"]) & uc_dict["charging_event"]["Type"].isin(
-                ["Private"])
-            ]
+            charging_events_private = uc_dict["charging_event"].loc[
+                uc_dict["charging_event"]["charging_use_case"].isin(["street"]) & uc_dict["charging_event"]["Type"].isin(
+                    ["Private"])
+                ]
 
-        charging_events = pd.concat([charging_events_private, charging_events_commerical], ignore_index=True)
+            charging_events = pd.concat([charging_events_private, charging_events_commerical], ignore_index=True)
 
     else:
         charging_events = charging_events_public.reset_index()
@@ -424,11 +427,11 @@ def retail(retail_data: gpd.GeoDataFrame, uc_dict):
 
         # Depot Ladeevents in den Nachtstunden (Mo-Sa zwischen 21:00 und 8:00 Uhr)
         charging_events_street = uc_dict["charging_event"].loc[
-            uc_dict["charging_event"]["use_case"].isin(["street"]) & uc_dict["charging_event"]["Type"].isin(["Commercial"])
+            uc_dict["charging_event"]["charging_use_case"].isin(["street"]) & uc_dict["charging_event"]["Type"].isin(uc_dict["multi_use_group"])
         ]
         charging_events_public = charging_events_street.reset_index()
 
-        # Verteilung der Depot-Ladeevents auf Retail-Standorte
+        # Verteilung der Street-Ladeevents auf Retail-Standorte
         charging_locations_retail_after_multi_use, located_public_events = uc_helpers.distribute_charging_events(
             charging_locations_retail, charging_events_public, weight_column="area", simulation_steps=2000,
             rng=uc_dict["random_seed"], fill_existing_only=True, availability_mask=availability_mask,
@@ -436,6 +439,10 @@ def retail(retail_data: gpd.GeoDataFrame, uc_dict):
         ) # charging_events_depot austauschen gegen depot_night_events
 
         located_public_events_assigned = located_public_events[located_public_events["assigned_location"].notna()]
+
+        located_public_events_assigned["multi_use"] = True
+
+        located_charging_events["multi_use"] = False
 
         # Kombiniere Retail- und Depot-Ladeevents
         located_charging_events = pd.concat([located_charging_events, located_public_events_assigned], ignore_index=True)
@@ -460,10 +467,13 @@ def retail(retail_data: gpd.GeoDataFrame, uc_dict):
     charging_locations_retail["location_id"] = uc_helpers.get_id(uc_id, pd.Series(charging_locations_retail.index).astype(int))
 
     charging_locations = charging_locations_retail[uc_dict["columns_output_locations"]]
-    located_charging_events_gdf = located_charging_events_gdf[uc_dict["columns_output_chargingevents"]]
+    if uc_dict["multi_use_concept"]:
+        keys = uc_dict["columns_output_chargingevents"] + ["multi_use"]
+        located_charging_events_gdf = located_charging_events_gdf[keys]
+    else:
+        located_charging_events_gdf = located_charging_events_gdf[uc_dict["columns_output_chargingevents"]]
 
     # todo checken o alle ids stimmen (bei multi-use-szenario)
-    # todo hier alle charging locations mit nr. ladepunkte gleich null raus nehmen
 
     charging_locations = charging_locations[charging_locations["charging_points"] != 0]
 

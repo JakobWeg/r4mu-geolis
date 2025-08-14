@@ -19,6 +19,7 @@ import utility
 
 def parse_data(args):
     # read config file
+    print("--- reading config file ---")
     parser = cp.ConfigParser()
     scenario_path = pathlib.Path('scenario')
     cfg_file = pathlib.Path(scenario_path, 'config.cfg')
@@ -69,6 +70,7 @@ def parse_data(args):
         'random_seed': rng,
         'mode': args.mode,
         'multi_use_concept': parser['basic'].getboolean('multi_use_concept', None),
+        'multi_use_group': parser['basic'].get('multi_use_group').split(', '),
         'flexibility_multi_use': parser['basic'].getint('flexibility_multi_use', 0),
         'charge_events_private_path': parser.get('data', 'charging_events_private'),
         'charge_events_commercial_path': parser.get('data', 'charging_events_commercial'),
@@ -204,7 +206,7 @@ def parse_car_data(args, data_dict):
     charging_events_commercial["charging_use_case"] = charging_events_commercial["use_case"]
 
     # todo: check, ob beide Datensätze zur gleichen Zeit am gleichen Tag starten.
-    charging_events = pd.concat([charging_events_private, charging_events_commercial], ignore_index=True, sort=False)
+    charging_events = pd.concat([charging_events_commercial, charging_events_private], ignore_index=True, sort=False)
 
     charging_events = charging_events.drop(columns=["average_charging_power"])
 
@@ -341,7 +343,10 @@ def main():
         # utility.plot_occupation_of_charging_points(result_summary)
 
     # save meta data
-    meta_data = {k: data.get(k) for k in ['charge_events_private_path', 'charge_events_commercial_path', 'multi_use_concept', 'flexibility_multi_use', 'charging_time_limit', 'charging_time_limit_duration', 'charging_time_limit_start', 'charging_time_limit_end']}
+    meta_data = {k: data.get(k) for k in ['charge_events_private_path', 'charge_events_commercial_path',
+                                          'multi_use_concept', 'flexibility_multi_use', 'multi_use_group',
+                                          'charging_time_limit', 'charging_time_limit_duration',
+                                          'charging_time_limit_start', 'charging_time_limit_end']}
 
     with open(os.path.join(data["result_dir"],'metadata.json'), 'w') as f:
         json.dump(meta_data, f)

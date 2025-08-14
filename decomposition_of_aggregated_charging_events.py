@@ -39,9 +39,35 @@ ladeparameter = {
 }
 
 # Lade CSV (angenommen: Index ist Zeitstempel, Spalten sind Use-Cases)
-df = pd.read_csv(f"data/dlr_data/{year}/aggregated_result_table_ppc_id_and_week_hour.csv", index_col=0, parse_dates=True)
 
 lade_use_cases_def = pd.read_csv(f"data/dlr_data/{year}/charging_stations_availability.csv", sep=";")
+
+eliminate_company_cars = True
+correction_factor = 0.55
+
+if eliminate_company_cars:
+    # Abziehen der
+    if year == 2035:
+        df_n1 = pd.read_csv(f"data/dlr_data/{year}/aggregated_result_table_ppc_id_and_week_hour_n1.csv", sep=";",
+                            parse_dates=True)
+    else:
+        df_n1 = pd.read_csv(f"data/dlr_data/{year}/aggregated_result_table_ppc_id_and_week_hour_n1.csv", index_col=0,
+                         parse_dates=True)
+    df_pkw_n1 = pd.read_csv(f"data/dlr_data/{year}/aggregated_result_table_ppc_id_and_week_hour_pkw_n1.csv", index_col=0,
+                     parse_dates=True)
+
+    # df_n1 von df_pkw_n1 abziehen und somit df_pkw erhalten
+
+    df_pkw_n1 = df_pkw_n1.astype(int)
+    df_n1 = df_n1.astype(int)
+
+    df_pkw = df_pkw_n1 - df_n1
+    df_pkw_neu = df_pkw.mul(correction_factor).astype(int)
+
+    df = df_pkw_neu + df_n1
+
+else:
+    df = pd.read_csv(f"data/dlr_data/{year}/aggregated_result_table_ppc_id_and_week_hour.csv", index_col=0, parse_dates=True)
 
 # mapping = {
 #     101: "depot",
@@ -175,7 +201,7 @@ if test:
 
     # Ladeevents einsortieren
     for _, row in events_df.iterrows():
-        ladezeiten_dt = pd.date_range(start=row["event_start"], end=row["event_end_parking"], freq="H", closed="left")
+        ladezeiten_dt = pd.date_range(start=row["event_start"], end=row["event_end_parking"], freq="H") #, closed="left")
         ladezeiten = pd.DataFrame(list(range(int(round(row["event_start"], 0)), int(round(row["event_end_parking"]+1, 0)))))
         for zeit in ladezeiten[0]:
             if zeit in timeline.index:
@@ -206,7 +232,7 @@ if test:
     }
     timeline['Wochentag_Uhrzeit'] = timeline['Datum_Uhrzeit'].dt.strftime('%A %H:%M').replace(wochentage_de, regex=True)
 
-    timeline.to_csv(f"data/dlr_data/results_decomposition/simulierte_ladeevents_kumuliert_2035{year}.csv", index=False)
+    timeline.to_csv(f"data/dlr_data/results_decomposition/simulierte_ladeevents_kumuliert_{year}.csv", index=False)
     # Daten für Stackplot vorbereiten
     #use_cases = timeline.columns.tolist()
     werte = [timeline[uc].values for uc in use_cases]

@@ -321,7 +321,7 @@ def calculate_share_of_public_home_charging():
 if __name__ == "__main__":
     # charging_events = pd.read_parquet("combined_charging_events.parquet")
     # print(charging_events)
-    # combine_csv_to_parquet("//FS01/RedirectedFolders/Jakob.Wegner/Desktop/r4mu_übergabe/2045/scaling_1000_fix_default_2024-12-05_114939_simbev_run/SR_Metro",
+    # combine_csv_to_parquet("//FS01/RedirectedFolders/Jakob.Wegner/Desktop/r4mu_übergabe/2045_alt/scaling_1000_fix_default_2024-12-05_114939_simbev_run/SR_Metro",
     #                        "scenario/combined_charging_events_2045_1.parquet")
     # convert_geodata_for_uc_work(landusepath="data/Reale_Nutzung_2021_Umweltatlas.gpkg", alkispath="data/ALKIS_Berlin_Gebäude.gpkg")
     filter_points_within_boundary()

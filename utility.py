@@ -7,102 +7,73 @@ from datetime import timedelta
 import matplotlib.pyplot as plt
 
 
-def plot_occupation_of_charging_points(events_df, uc_id):
-
+def plot_occupation_of_charging_points(events_df, uc_id, year, scenario):
     print("start of plotting timeline")
 
     # Zeitraster
     start = math.floor(events_df["event_start"].min())
-    events_df["event_end"] = events_df["event_start"]+events_df["event_time"]
-    end = math.ceil(events_df["event_end"]).max()
+    events_df["event_end"] = events_df["event_start"] + events_df["event_time"]
+    end = events_df["event_end"].max()
     zeitindex = list(range(start, end))
     zeitindex_df = pd.DataFrame({'zeitindex': zeitindex})
 
     # Zeitraster vorbereiten
     timeline = pd.DataFrame(index=zeitindex_df["zeitindex"])
-    for use_case in events_df["use_case"].unique():
+    for use_case in events_df["charging_use_case"].unique():
         timeline[use_case] = 0
 
     # Ladeevents einsortieren
     for _, row in events_df.iterrows():
-        ladezeiten_dt = pd.date_range(start=row["event_start"], end=row["event_end"], freq="H",
-                                      closed="left")
         ladezeiten = pd.DataFrame(
-            list(range(int(round(row["event_start"], 0)), int(round(row["event_end"] + 1, 0)))))
+            list(range(int(round(row["event_start"], 0)),
+                       int(round(row["event_end"], 0))))
+        )
         for zeit in ladezeiten[0]:
             if zeit in timeline.index:
                 timeline.at[zeit, row["charging_use_case"]] += 1
 
     use_cases = timeline.columns.tolist()
 
-    # add day and time
-    # Starte Montag 00:00 Uhr
-    startzeit_date = datetime.strptime("2024-01-01 00:00", "%Y-%m-%d %H:%M")  # 1. Jan. 2024 ist ein Montag
+    # Neuen fortlaufenden Zeitschritt erzeugen
+    timeline = timeline.reset_index(drop=True)  # alten Index entfernen
+    timeline["Zeitschritt"] = range(1, len(timeline) + 1)
 
-    # Erstelle eine neue Spalte mit Datum + Uhrzeit
-    times = pd.Series(timeline.index.values)
-    timeline['Datum_Uhrzeit'] = times.apply(lambda h: startzeit_date + timedelta(hours=h - 2))
+    timeline.to_csv(
+        f"data/dlr_data/results_decomposition/simulierte_ladeevents_kumuliert_{uc_id}.csv",
+        index=False
+    )
 
-    # Extrahiere Wochentag + Uhrzeit
-    timeline['Wochentag_Uhrzeit'] = timeline['Datum_Uhrzeit'].dt.strftime('%A %H:%M')
-
-    # Optional: deutsche Wochentage (wenn du willst)
-    wochentage_de = {
-        'Monday': 'Montag',
-        'Tuesday': 'Dienstag',
-        'Wednesday': 'Mittwoch',
-        'Thursday': 'Donnerstag',
-        'Friday': 'Freitag',
-        'Saturday': 'Samstag',
-        'Sunday': 'Sonntag'
-    }
-    timeline['Wochentag_Uhrzeit'] = timeline['Datum_Uhrzeit'].dt.strftime('%A %H:%M').replace(wochentage_de,
-                                                                                              regex=True)
-
-    timeline.to_csv(f"data/dlr_data/results_decomposition/simulierte_ladeevents_kumuliert_{uc_id}.csv",
-                    index=False)
     # Daten für Stackplot vorbereiten
-    # use_cases = timeline.columns.tolist()
     werte = [timeline[uc].values for uc in use_cases]
 
-    # Gestapelter Linien-Plot (stackplot = gestapelte Flächen)
-    # plt.figure(figsize=(12, 6))
-    # plt.stackplot(timeline.index, werte, labels=use_cases)
-    #
-    # plt.title("Gestapelte gleichzeitige Ladeevents pro Use-Case")
-    # plt.xlabel("Zeit")
-    # plt.ylabel("Anzahl gleichzeitig ladender Fahrzeuge")
-    # plt.legend(title="Use-Case")
-    # plt.grid(True)
-    # plt.tight_layout()
-    # plt.savefig(f"data/dlr_data/results_decomposition/simulierte_ladeevents_kumuliert_{uc_id}")
-    #
-    # plt.close()
-
+    print("start plotting 1")
     plt.figure(figsize=(12, 6))
-    plt.stackplot(timeline['Datum_Uhrzeit'], timeline['depot'], labels=use_cases)
+    plt.stackplot(timeline['Zeitschritt'], timeline['retail'], labels=use_cases)
 
     plt.title("Gestapelte gleichzeitige Ladeevents pro Use-Case")
-    plt.xlabel("Zeit")
+    plt.xlabel("Zeitschritt")
     plt.ylabel("Anzahl gleichzeitig ladender Fahrzeuge")
     plt.legend(title="Use-Case")
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig(f"data/dlr_data/results_decomposition/simulierte_ladeevents_kumuliert_{uc_id}")
+    plt.savefig(
+        f"data/dlr_data/results_decomposition/simulierte_ladeevents_kumuliert_{uc_id}"
+    )
 
     plt.close()
-
+    print("start plotting 2")
     plt.figure(figsize=(12, 6))
-    plt.stackplot(timeline['Datum_Uhrzeit'], werte, labels=use_cases)
+    plt.stackplot(timeline['Zeitschritt'], werte, labels=use_cases)
 
     plt.title("Gestapelte gleichzeitige Ladeevents pro Use-Case")
-    plt.xlabel("Zeit")
+    plt.xlabel("Zeitschritt")
     plt.ylabel("Anzahl gleichzeitig ladender Fahrzeuge")
     plt.legend(title="Use-Case")
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig(f"data/dlr_data/results_decomposition/simulierte_ladeevents_kumuliert_Uhrzeit_{uc_id}")
-
+    plt.savefig(
+        f"data/dlr_data/results_decomposition/simulierte_ladeevents_kumuliert_{scenario}_{year}_{uc_id}"
+    )
 
 def weights_to_dict(weights: pd.DataFrame):
     result = {}
@@ -135,3 +106,12 @@ def save_data(data: gpd.GeoDataFrame, uc, dataset_name, uc_dict):
     data.reset_index(drop=True, inplace=True)
     data.to_csv(save_path_csv, sep=',', decimal='.')
     print('saving {} in region {} successful'.format(uc, dataset_name))
+
+
+if __name__ == '__main__':
+    year = 2045
+    scenario = "multi-use-flex"
+    df = pd.read_csv("results/_25-08-13_091910/output_retail_charging-events.csv", index_col=0)
+    df.loc[df["multi_use"], "charging_use_case"] = "retail_multi-use"
+    df.loc[df["charging_use_case"] == "urban_fast", "charging_use_case"] = "retail"
+    plot_occupation_of_charging_points(df, "retail", year, scenario)
