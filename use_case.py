@@ -1,9 +1,11 @@
-import plots as plots
+# import plots as plots
 import utility as utility
 import pandas as pd
 import geopandas as gpd
+import numpy as np
 import math
 import use_case_helpers as uc_helpers
+import heapq
 
 def hpc(hpc_data: gpd.GeoDataFrame, uc_dict, timestep=15):
     """
@@ -44,7 +46,7 @@ def hpc(hpc_data: gpd.GeoDataFrame, uc_dict, timestep=15):
             charging_locations_hpc,
             located_charging_events,
         ) = uc_helpers.distribute_charging_events(
-            in_region, charging_events, weight_column="count", simulation_steps=2000,
+            in_region, charging_events, weight_column="gewicht", simulation_steps=2000,
             rng=uc_dict["random_seed"])
 
         # Merge Chargin_events and Locations
@@ -101,126 +103,247 @@ def public(
             charging_events_commerical = charging_locations_public_after_multi_use.reset_index(drop=True)
 
             charging_events_private = uc_dict["charging_event"].loc[
-                uc_dict["charging_event"]["charging_use_case"].isin(["street"]) & uc_dict["charging_event"]["Type"].isin(
+                uc_dict["charging_event"]["charging_use_case"].isin(["street"]) & uc_dict["charging_event"][
+                    "Type"].isin(
                     ["Private"])
                 ]
 
             charging_events = pd.concat([charging_events_private, charging_events_commerical], ignore_index=True)
-
     else:
         charging_events = charging_events_public.reset_index()
 
-    # charging_events = charging_events.iloc[:1000]
+    if uc_dict["additional_public_input"]:
 
-    charging_events_home_street = charging_events.loc[
-        charging_events["location"] == "home"
-    ].reset_index(drop=True)
-    charging_events_not_home_street = charging_events.loc[
-        charging_events["location"] != "home"
-    ].reset_index(drop=True)
-    in_region_home_street = public_data_home_street
+        # Inputs aus deinem Beispiel
+        charging_locations = uc_dict['additional_public_locations']
+        located_charging_events = uc_dict['additional_public_events']
 
-    in_region_not_home_street = public_data_not_home_street
+        located_charging_events_gdf = located_charging_events[
+            located_charging_events["event_id"].isin(charging_events["event_id"])
+        ]
 
-    if in_region_home_street is not None:
-        # todo: die beiden Datensätze zusammenführen. Alternative: Getrennte berechnung von home street und public street -> Zusammenführung von Ladepunkten, die in einem Umkreis von bsp. 150 m liegen
-        # todo: Alternative: Wenn neuer Ladepunkt hinzugefügt werden soll, dann über zuordnung home street oder not home street. Zuerst werden aber alle LP die existieren verwendet werden home street & not home street
+        events = located_charging_events_gdf.copy()
+        locs = charging_locations.copy()
 
-        in_region_home_street = in_region_home_street.rename(columns={'households_total': 'total_weight'})
-        in_region_not_home_street = in_region_not_home_street.rename(columns={'@id': 'id'})
-        in_region_home_street = in_region_home_street[["total_weight", "geometry"]]
-        in_region_not_home_street = in_region_not_home_street[["total_weight", "geometry"]]
-        in_region_home_street["mode"] = "home_street"
-        in_region_not_home_street["mode"] = "not_home_street"
+        # --- Typen & Endzeit (diskrete Zeit, [start, end) ) ---
+        events["event_start"] = pd.to_numeric(events["event_start"], errors="coerce").astype("Int64")
+        events["event_time"] = pd.to_numeric(events["event_time"], errors="coerce").astype("Int64")
+        events = events.dropna(subset=["location_id", "event_start", "event_time"]).copy()
+        events["event_end"] = events["event_start"] + events["event_time"]
 
+        # --- Kapazitäten je Standort (harte Obergrenze) ---
+        cap = (
+            locs.set_index("location_id")["charging_points"]
+            .fillna(0).astype(int)
+            .to_dict()
+        )
+        all_locations = list(locs["location_id"].unique())
 
+        # Aktuelle Belegung und Peaks
+        load = {lid: 0 for lid in all_locations}
+        max_load = {lid: 0 for lid in all_locations}
 
-        in_region = pd.concat([in_region_home_street, in_region_not_home_street], ignore_index=True)
+        # Verfügbarkeits-Heap: nur Locations mit cap>0 kommen rein
+        # (Eintrag: (current_load, location_id); lazy updates bei Änderungen)
+        availQ = [(0, lid) for lid in all_locations if cap.get(lid, 0) > 0]
+        heapq.heapify(availQ)
+
+        # Globale Endzeiten-Queue: (end_time, location_id)
+        endQ = []
+
+        # Events sortiert nach Start (bei Gleichstand längere zuerst ist optional)
+        ev_idx = events.sort_values(by=["event_start", "event_time"], ascending=[True, False]).index
+
+        # Ergebnis-Spalten
+        events["assigned_location_id"] = pd.Series(pd.NA, index=events.index, dtype="Int64")
+        events["was_reassigned"] = False
+        events["unserved"] = False
+
+        def release_finished(until_time: int):
+            """Alle Enden <= until_time verarbeiten (Last senken, availQ updaten)."""
+            while endQ and endQ[0][0] <= until_time:
+                end_t, lid = heapq.heappop(endQ)
+                load[lid] -= 1
+                # Falls nach dem Freigeben noch Kapazität frei: neuen (akt. load, lid) eintragen
+                if load[lid] < cap.get(lid, 0):
+                    heapq.heappush(availQ, (load[lid], lid))
+
+        for idx in ev_idx:
+            start = int(events.at[idx, "event_start"])
+            end = int(events.at[idx, "event_end"])
+            orig = events.at[idx, "location_id"]
+
+            # 1) Erst beendete Ladevorgänge freigeben
+            release_finished(start)
+
+            chosen = None
+
+            # 2) Bevorzugt: Originalstandort, falls dort freie Kapazität
+            if cap.get(orig, 0) > 0 and load[orig] < cap[orig]:
+                chosen = orig
+            else:
+                # 3) Sonst: Standort mit minimaler aktueller Belegung aus availQ (lazy updates)
+                while availQ:
+                    cand_load, cand = heapq.heappop(availQ)
+                    # veraltete Einträge überspringen
+                    if cand_load != load[cand]:
+                        continue
+                    # nur nehmen, wenn noch Kapazität frei
+                    if load[cand] < cap.get(cand, 0):
+                        chosen = cand
+                        break
+                # wenn keiner frei ist -> unserved
+
+            if chosen is None:
+                events.at[idx, "unserved"] = True
+                continue
+
+            # 4) Zuweisen
+            load[chosen] += 1
+            max_load[chosen] = max(max_load[chosen], load[chosen])
+            heapq.heappush(endQ, (end, chosen))
+
+            # Standort bleibt ggf. weiter verfügbar -> neuen Zustand in availQ schreiben
+            if load[chosen] < cap.get(chosen, 0):
+                heapq.heappush(availQ, (load[chosen], chosen))
+
+            events.at[idx, "assigned_location_id"] = chosen
+            events.at[idx, "was_reassigned"] = (chosen != orig)
+
+        # 5) Neue charging_points = beobachteter Peak je Standort
+        #    (entspricht der minimal nötigen Anzahl simultaner Punkte unter Kapazitätszwang)
+        peak_series = pd.Series(max_load, name="charging_points")
+        locs = locs.copy()
+        locs["charging_points"] = locs["location_id"].map(peak_series).fillna(0).astype(int)
+
+        # 6) Überschreiben der location_id nur, wenn zugewiesen (nicht für unserved)
+        mask_assigned = events["assigned_location_id"].notna()
+        events.loc[mask_assigned, "location_id"] = events.loc[mask_assigned, "assigned_location_id"].astype(
+            events["location_id"].dtype)
+
+        # Outputs wie gehabt
+        charging_locations = locs[locs["charging_points"] > 0].reset_index(drop=True)
+        located_charging_events_gdf = events
+
 
     else:
-        in_region = in_region_not_home_street
 
-    (
-        charging_locations_public_home,
-        located_charging_events_public_home,
-    ) = uc_helpers.distribute_charging_events(
-        in_region[in_region["mode"] == "home_street"],
-        charging_events_home_street,
-        weight_column="total_weight",
-        simulation_steps=2000,
-        rng=uc_dict["random_seed"],
-    )
-    charging_locations_public_home["mode"] = "home_street"
-    located_charging_events_public_home["mode"] = "home_street"
+        charging_events_home_street = charging_events.loc[
+            charging_events["location"] == "home"
+        ].reset_index(drop=True)
+        charging_events_not_home_street = charging_events.loc[
+            charging_events["location"] != "home"
+        ].reset_index(drop=True)
+        in_region_home_street = public_data_home_street
 
-    (
-        charging_locations_public,
-        located_charging_events_public,
-    ) = uc_helpers.distribute_charging_events(
-        in_region[in_region["mode"] == "not_home_street"],
-        charging_events_not_home_street,
-        weight_column="total_weight",
-        simulation_steps=2000,
-        rng=uc_dict["random_seed"],
-        #home_street=uc_dict["run_home"]
-    )
+        in_region_not_home_street = public_data_not_home_street
 
-    charging_locations_public["mode"] = "street"
-    located_charging_events_public["mode"] = "street"
+        if in_region_home_street is not None:
 
-    # todo: datensatz für public home anpassen
+            in_region_home_street = in_region_home_street.rename(columns={'households_total': 'Weight'})
+            in_region_not_home_street = in_region_not_home_street.rename(columns={'@id': 'id'})
+            if uc_dict["additional_public_input"]:
+                in_region_home_street = in_region_home_street[["Weight", "charging_points", "average_charging_capacity", "geometry"]]
+                in_region_not_home_street = in_region_not_home_street[["Weight", "charging_points", "average_charging_capacity", "geometry"]]
+            else:
+                in_region_home_street = in_region_home_street[["Weight", "geometry"]]
+                in_region_not_home_street = in_region_not_home_street[["Weight", "geometry"]]
+            in_region_home_street["mode"] = "home_street"
+            in_region_not_home_street["mode"] = "not_home_street"
 
-    located_charging_events_public_home[
-        "assigned_location"
-    ] = located_charging_events_public_home["assigned_location"] + len(
-        charging_locations_public
-    )
 
-    # concat charging events and location at home and public
-    charging_locations = pd.concat(
-        [charging_locations_public, charging_locations_public_home], ignore_index=True
-    )
-    located_charging_events = pd.concat(
-        [located_charging_events_public, located_charging_events_public_home],
-        ignore_index=True,
-    )
 
-    # charging_locations = charging_locations_public
-    # located_charging_events = located_charging_events_public
+            in_region = pd.concat([in_region_home_street, in_region_not_home_street], ignore_index=True)
 
-    # Merge Chargin_events and Locations
-    charging_locations["index"] = charging_locations.index
-    located_charging_events = located_charging_events.merge(
-        charging_locations, left_on="assigned_location", right_on="index"
-    )
+        else:
+            in_region = in_region_not_home_street
 
-    located_charging_events_gdf = gpd.GeoDataFrame(
-        located_charging_events, geometry="geometry"
-    )
-    located_charging_events_gdf.to_crs(3035)
+        fill_existing_only = bool(uc_dict["additional_public_input"])
 
-    # generate_ids and reduce columns
-    located_charging_events_gdf["location_id"] = uc_helpers.get_id(uc_id, located_charging_events_gdf[
-        "assigned_location"].astype(int))
-    charging_locations["location_id"] = uc_helpers.get_id(uc_id, pd.Series(charging_locations.index).astype(int))
+        (
+            charging_locations_public_home,
+            located_charging_events_public_home,
+        ) = uc_helpers.distribute_charging_events(
+            in_region[in_region["mode"] == "home_street"],
+            charging_events_home_street,
+            weight_column="Weight",
+            simulation_steps=2000,
+            rng=uc_dict["random_seed"],
+            # fill_existing_only=fill_existing_only,
+            fill_existing_first=True,
+            additional_street_input=bool(uc_dict["additional_public_input"])
+        )
+        charging_locations_public_home["mode"] = "home_street"
+        located_charging_events_public_home["mode"] = "home_street"
 
-    columns_locations = uc_dict["columns_output_locations"].copy()
-    columns_locations.append("mode")
+        (
+            charging_locations_public,
+            located_charging_events_public,
+        ) = uc_helpers.distribute_charging_events(
+            in_region[in_region["mode"] == "not_home_street"],
+            charging_events_not_home_street,
+            weight_column="Weight",
+            simulation_steps=2000,
+            rng=uc_dict["random_seed"],
+            #fill_existing_only=fill_existing_only,
+            fill_existing_first=True,
+            additional_street_input=bool(uc_dict["additional_public_input"])
+            #home_street=uc_dict["run_home"]
+        )
 
-    columns_events = uc_dict["columns_output_chargingevents"].copy()
-    columns_events.append("mode")
+        charging_locations_public["mode"] = "street"
+        located_charging_events_public["mode"] = "street"
 
-    charging_locations = charging_locations[columns_locations]
-    located_charging_events_gdf = located_charging_events_gdf.rename(columns={"mode_x": "mode"})
-    located_charging_events_gdf = located_charging_events_gdf[columns_events]
+        located_charging_events_public_home[
+            "assigned_location"
+        ] = located_charging_events_public_home["assigned_location"] + len(
+            charging_locations_public
+        )
 
-    charging_locations = charging_locations[charging_locations["charging_points"] != 0]
+        # concat charging events and location at home and public
+        charging_locations = pd.concat(
+            [charging_locations_public, charging_locations_public_home], ignore_index=True
+        )
+        located_charging_events = pd.concat(
+            [located_charging_events_public, located_charging_events_public_home],
+            ignore_index=True,
+        )
 
-    # todo postprocessing of locations:
-    postprocessing = True
-    if postprocessing:
-        charging_locations, located_charging_events = uc_helpers.postprocess_public_demands(charging_locations,
-        located_charging_events_gdf)
+        # charging_locations = charging_locations_public
+        # located_charging_events = located_charging_events_public
+
+        # Merge Chargin_events and Locations
+        charging_locations["index"] = charging_locations.index
+        located_charging_events = located_charging_events.merge(
+            charging_locations, left_on="assigned_location", right_on="index"
+        )
+
+        located_charging_events_gdf = gpd.GeoDataFrame(
+            located_charging_events, geometry="geometry"
+        )
+        located_charging_events_gdf.to_crs(3035)
+
+        # generate_ids and reduce columns
+        located_charging_events_gdf["location_id"] = uc_helpers.get_id(uc_id, located_charging_events_gdf[
+            "assigned_location"].astype(int))
+        charging_locations["location_id"] = uc_helpers.get_id(uc_id, pd.Series(charging_locations.index).astype(int))
+
+        columns_locations = uc_dict["columns_output_locations"].copy()
+        columns_locations.append("mode")
+
+        columns_events = uc_dict["columns_output_chargingevents"].copy()
+        columns_events.append("mode")
+
+        charging_locations = charging_locations[columns_locations]
+        located_charging_events_gdf = located_charging_events_gdf.rename(columns={"mode_x": "mode"})
+        located_charging_events_gdf = located_charging_events_gdf[columns_events]
+
+        charging_locations = charging_locations[charging_locations["charging_points"] != 0]
+
+        postprocessing = True
+        if postprocessing:
+            charging_locations, located_charging_events = uc_helpers.postprocess_public_demands(charging_locations,
+            located_charging_events_gdf)
 
     charging_locations = charging_locations[charging_locations["charging_points"] != 0]
 
@@ -420,7 +543,6 @@ def retail(retail_data: gpd.GeoDataFrame, uc_dict):
         in_region, charging_events, weight_column="area", simulation_steps=2000,
         rng=uc_dict["random_seed"], return_mask=True
     )
-
 
     if uc_dict["multi_use_concept"]:
         print("multi-use-concept activated")

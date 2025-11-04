@@ -68,20 +68,6 @@ def postprocess_public_demands(charging_locations: gpd.GeoDataFrame, located_cha
 
             if loc_with_free_capacity is not None:
                 new_location_id = loc_with_free_capacity["location_id"]
-            # else:
-                # Kein freier Punkt: nächstgelegenen Standort wählen, Ladepunkt hinzufügen
-                # candidate_locs["dist"] = candidate_locs.geometry.distance(event_point)
-                # nearest_loc = candidate_locs.sort_values("dist").iloc[0]
-                # new_location_id = nearest_loc["location_id"]
-                #
-                # charging_locations.loc[
-                #     charging_locations["location_id"] == new_location_id, "charging_points"
-                # ] += 1
-                #
-                # zugeschlagene_punkte += 1
-
-                # if new_location_id not in occupancy_mask:
-                #     occupancy_mask[new_location_id] = np.zeros(max_step + 1, dtype=int)
 
                 # Ladevent umverteilen
                 located_charging_events.at[idx, "location_id"] = new_location_id
@@ -222,18 +208,23 @@ def distribute_charging_events(
     fill_existing_only: bool = False,  # New behavior
     availability_mask: np.array = None,
     flexibility_multi_use: int = 0,
-    return_mask: bool = False
+    return_mask: bool = False,
+    seed: int = 1,
+    additional_street_input: bool = False
 ):
     """
     Distributes charging events to locations with optional random assignment.
     Tracks number of charging points and average charging capacity per location.
     If 'fill_existing_only' is True, only existing charging points are filled.
     """
+    # reset seed so that the locations are always the same
+    rng = np.random.default_rng(seed)
 
     if fill_existing_only:
         print("Using the 'fill_existing_only' method: Only existing charging points will be filled.")
         return distribute_charging_events_fill_existing_only(
-            locations, events, weight_column, simulation_steps, flexibility_multi_use, rng, availability_mask
+            locations, events, weight_column, simulation_steps, flexibility_multi_use, rng, availability_mask,
+            additional_street_input= additional_street_input
         )
 
     # if home_street:
@@ -272,6 +263,8 @@ def distribute_charging_events(
 
         if fill_existing_first:
 
+            if additional_street_input:
+                availability_mask = np.zeros((len(locations), 2000))
             if availability.size < 1:
                 print()
             if start >= end:
@@ -326,13 +319,16 @@ def distribute_charging_events_fill_existing_only(
     simulation_steps: int,
     max_shift_steps: int = 0,
     rng: np.random.Generator = None,
-    availability_mask: np.array = None
+    availability_mask: np.array = None,
+    additional_street_input: bool = False
 ):
     """
     Distributes charging events to existing locations with available charging points.
     Does not add new charging points. If all charging points are filled, no further charging events are assigned.
     Allows rescheduling events by up to `max_shift_steps` time steps if no immediate availability is found.
     """
+    if additional_street_input:
+        availability_mask = np.zeros((len(locations), 2000))
 
     n_locations = len(locations)
     n_events = len(events)

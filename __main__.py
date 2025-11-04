@@ -67,6 +67,7 @@ def parse_data(args):
         'visual': parser.getboolean("basic", "plots"),
         # 'charge_info': charge_info_dict,
         'scenario_name': args.scenario,
+        'seed': rng_seed,
         'random_seed': rng,
         'mode': args.mode,
         'multi_use_concept': parser['basic'].getboolean('multi_use_concept', None),
@@ -79,9 +80,14 @@ def parse_data(args):
     }
 
     if run_hpc:
-        hpc_pos_file = parser.get('data', 'hpc_positions')
-        positions = gpd.read_file(pathlib.Path(data_dir, hpc_pos_file))
-        config_dict["hpc_points"] = positions
+        hpc_pos_file = parser.get('data', 'hpc_positions_fuel_stations')
+        hpc_traffic = parser.get('data', 'hpc_traffic_count')
+        positions = gpd.read_file(pathlib.Path(data_dir, hpc_pos_file), encoding='latin1')
+        traffic = gpd.read_file(pathlib.Path(data_dir, hpc_traffic), encoding='latin1')
+
+        # calculate weighted hpc locations
+        hpc_locations = utility.calculate_hpc_locations(positions, traffic)
+        config_dict["hpc_points"] = hpc_locations
         # if run_retail:
         #     config_dict["hpc_share_retail"] = parser.getfloat("uc_params", "hpc_share_retail"),
         print("--- parsing hpc data done ---")
@@ -120,12 +126,44 @@ def parse_data(args):
         public_data = gpd.read_file(pathlib.Path(data_dir, public_data_file))
         public_data = public_data.to_crs(3035)
 
-
         public_home_street_data = home_data_apartment
 
-        config_dict.update({'poi_data': public_data,
+        additional_public_input = parser.getboolean('data', 'additional_input_public_locations')
+
+        config_dict.update({'additional_public_input': additional_public_input,
+                            'poi_data': public_data,
                             'home_street_data': public_home_street_data,
                             })
+
+        if additional_public_input:
+            additional_public_locations_file = parser.get('data', 'additional_public_locations')
+            public_locations = gpd.read_file(pathlib.Path(data_dir, additional_public_locations_file))
+
+            # Sicherstellen, dass beide denselben CRS haben
+            # additional_public_data = additional_public_locations.to_crs(public_data.crs)
+
+            additional_public_events_file = parser.get('data', 'additional_public_events')
+            public_events = gpd.read_file(pathlib.Path(data_dir, additional_public_events_file))
+
+            # Innerer räumlicher Join: nur Punkte, die in beiden vorkommen (genau gleiche Geometrie)
+            # public_data = public_data.merge(additional_public_data, on='geometry', how='inner', suffixes=('_1', '_2'))
+
+            # additional_home_street_data_file = parser.get('data', 'additional_home_street_locations')
+            # additional_home_street_data = gpd.read_file(pathlib.Path(data_dir, additional_public_data_file))
+
+            # Sicherstellen, dass beide denselben CRS haben
+            # additional_public_data = additional_home_street_data.to_crs(public_home_street_data.crs)
+
+            # public_home_street_data = public_home_street_data.merge(additional_home_street_data,
+            #                                                         on='geometry', how='inner', suffixes=('_1', '_2'))
+
+
+            config_dict.update({'additional_public_input': additional_public_input,
+                                'additional_public_locations': public_locations,
+                                'additional_public_events': public_events,
+                                'poi_data': public_data,
+                                'home_street_data': public_home_street_data,
+                                })
         print("--- parsing public data done ---")
 
     if run_work:
@@ -177,6 +215,14 @@ def parse_car_data(args, data_dict):
         if file.endswith(".parquet"):
             file_path = os.path.join(ts_private_path, file)
             df = pd.read_parquet(file_path)  # Read the Parquet file
+            # write car-type into column
+            antriebsarten = ['bev', 'phev']
+            fahrzeugklassen = ['mini', 'medium', 'luxury']
+
+            found_antrieb = next((word for word in antriebsarten if word in file_path.lower()), None)
+            found_klasse = next((word for word in fahrzeugklassen if word in file_path), None)
+
+            df["car_type"] = f"{found_antrieb}_{found_klasse}"
             dataframes.append(df)
 
     # Concatenate all DataFrames vertically
@@ -212,6 +258,8 @@ def parse_car_data(args, data_dict):
 
     charging_events = charging_events[charging_events["event_start"] <= (24*7*4)].reset_index(drop=True)
 
+    charging_events["event_id"] = range(1, len(charging_events) + 1)
+
     print ("--- parsing charging events done")
 
     if data_dict["run_home"]:
@@ -243,7 +291,9 @@ def parse_default_data(args):
     charging_event_data = parse_car_data(args, data_dict)
     data_dict["charging_event"] = charging_event_data
     data_dict["columns_output_locations"] = ["location_id", "charging_points", "average_charging_capacity", "geometry"]
-    data_dict["columns_output_chargingevents"] = ["charging_use_case", "event_start", "event_time", "energy", "station_charging_capacity", "location_id", "geometry"]
+    data_dict["columns_output_chargingevents"] = ["event_id", "charging_use_case", "car_type", "event_start", "event_time",
+                                                  "energy", "soc_start", "soc_end", "station_charging_capacity",
+                                                  "location_id", "geometry"]
     return data_dict
 
 
@@ -369,5 +419,4 @@ def main():
 
 
 if __name__ == '__main__':
-    # todo: einarbeiten der bestehenden LIS (Im UC Public, Retail und hpc), Niedrige Prio
     main()
