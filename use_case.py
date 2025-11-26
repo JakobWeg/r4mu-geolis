@@ -643,8 +643,7 @@ def depot(depot_data: gpd.GeoDataFrame, uc_dict):
     in_region = depot_data
 
     if "area" not in in_region.columns:
-        first_col = in_region.columns[0]
-        in_region  = in_region.rename(columns={"area": "Area[m2]"})
+        in_region  = in_region.rename(columns={"Area[m2]": "area"})
 
     in_region = in_region.loc[in_region["area"] > 1]
     (
