@@ -247,6 +247,8 @@ def public(
                 in_region_not_home_street = in_region_not_home_street[["Weight", "charging_points", "average_charging_capacity", "geometry"]]
             else:
                 in_region_home_street = in_region_home_street[["Weight", "geometry"]]
+                if "Category_Weight" in in_region_not_home_street.columns:
+                    in_region_not_home_street = in_region_not_home_street.rename(columns={'Category_Weight': 'Weight'})
                 in_region_not_home_street = in_region_not_home_street[["Weight", "geometry"]]
             in_region_home_street["mode"] = "home_street"
             in_region_not_home_street["mode"] = "not_home_street"
@@ -523,6 +525,7 @@ def retail(retail_data: gpd.GeoDataFrame, uc_dict):
     # filter houses by region
     # in_region_bool = home_data["geometry"].within(uc_dict["boundaries"].iloc[0,0])
     # in_region = home_data.loc[in_region_bool].copy()
+
     cols = [
         "id_0",
         "osm_way_id",
@@ -533,6 +536,19 @@ def retail(retail_data: gpd.GeoDataFrame, uc_dict):
         "category",
         "geometry",
     ]
+
+    if any(col not in retail_data.columns for col in cols):
+
+        retail_data = retail_data.rename(columns={"nid": "id_0",
+                                    'osm_id': "osm_way_id",
+                                    # "amenity": "amenity",
+                                    "building": "other_tags",
+                                    # 'area': "area",
+                                    "access": "category",
+                                    # 'geometry': "geometry"
+                                    })
+        retail_data["id"] = retail_data["id_0"]
+
     in_region = retail_data[cols]
     in_region = in_region.loc[in_region["area"] > 100]
     (
@@ -625,6 +641,11 @@ def depot(depot_data: gpd.GeoDataFrame, uc_dict):
     charging_events = charging_events_depot.reset_index()
 
     in_region = depot_data
+
+    if "area" not in in_region.columns:
+        first_col = in_region.columns[0]
+        in_region  = in_region.rename(columns={"area": "Area[m2]"})
+
     in_region = in_region.loc[in_region["area"] > 1]
     (
         charging_locations_depot,

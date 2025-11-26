@@ -107,7 +107,7 @@ def filter_points_within_boundary():
     """
     # Lade die Punkte- und Grenzdaten
     print("loading boundaries")
-    boundary_gdf = gpd.read_file("data/Boundaries_Berlin_polygon.gpkg")
+    boundary_gdf = gpd.read_file("data_stralsund/Admin_Level_8_Stralsund_Polygon.gpkg")
     boundary_gdf = boundary_gdf.to_crs(3035)
 
     # Überprüfen, ob die Grenze ein einzelnes Polygon ist, und sicherstellen, dass es validiert ist
@@ -117,14 +117,14 @@ def filter_points_within_boundary():
         raise ValueError("Die Grenze ist ungültig. Bitte überprüfen Sie die Eingabedaten.")
     # Lade die Punkte- und Grenzdaten
     print("loading points")
-    points_gdf = gpd.read_file("data/teo_data/2025_03_28_new/osm_landuse_industry.gpkg",
+    points_gdf = gpd.read_file(r"C:/Users/jakob.wegner/OneDrive - Reiner Lemoine Institut gGmbH/Dokumente/02_QGIS\R4MU/teo_geodaten/374_demand_data2/mobi_data2/osm_buildings_residential_cts.gpkg",
                                engine='pyogrio', use_arrow=True)
     points_gdf = points_gdf.to_crs(3035)
     # Filtere Punkte, die innerhalb der Grenze liegen
     points_within_boundary = points_gdf[points_gdf.geometry.within(boundary)]
 
     # Speichere das gefilterte Ergebnis als GeoPackage
-    points_within_boundary.to_file("data/teo_data/2025_03_28_new/osm_landuse_industry_new.gpkg", driver='GPKG')
+    points_within_boundary.to_file("data_stralsund/osm_buildungs_residential_cts_stralsund.gpkg", driver='GPKG')
     print(f"Gefilterte Punkte erfolgreich in data gespeichert.")
 
     # # Öffne das Geopackage mit dem Polygon
@@ -321,8 +321,8 @@ def calculate_share_of_public_home_charging():
 if __name__ == "__main__":
     # charging_events = pd.read_parquet("combined_charging_events.parquet")
     # print(charging_events)
-    # combine_csv_to_parquet("//FS01/RedirectedFolders/Jakob.Wegner/Desktop/r4mu_übergabe/2045_alt/scaling_1000_fix_default_2024-12-05_114939_simbev_run/SR_Metro",
-    #                        "scenario/combined_charging_events_2045_1.parquet")
+    # combine_csv_to_parquet(r"C:\Users\jakob.wegner\PycharmProjects\simbev\scenarios\r4mu_stralsund_2035\results\default_2025-11-20_161319_simbev_run\LR_Zentr",
+    #                        "scenario/Ladeprofile_Privatverkehr_stralsund/combined_charging_events_2035_stralsund.parquet")
     # convert_geodata_for_uc_work(landusepath="data/Reale_Nutzung_2021_Umweltatlas.gpkg", alkispath="data/ALKIS_Berlin_Gebäude.gpkg")
     filter_points_within_boundary()
     # merge_geometries_to_polygon()

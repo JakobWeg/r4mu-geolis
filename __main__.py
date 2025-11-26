@@ -22,7 +22,7 @@ def parse_data(args):
     print("--- reading config file ---")
     parser = cp.ConfigParser()
     scenario_path = pathlib.Path('scenario')
-    cfg_file = pathlib.Path(scenario_path, 'config.cfg')
+    cfg_file = pathlib.Path(scenario_path, 'config_stralsund.cfg')
     data_dir = pathlib.Path('data')
 
     if not cfg_file.is_file():
@@ -190,6 +190,7 @@ def parse_data(args):
         # buildings_data = read_dataframe(pathlib.Path(data_dir, buildings_data_file))
         print("--- parsing retail data done ---")
         retail_data = retail_data.to_crs(3035)
+        retail_data["area"] = retail_data.geometry.area
         retail_data["geometry"] = retail_data["geometry"].centroid
         config_dict.update({'retail_parking_lots': retail_data})
 

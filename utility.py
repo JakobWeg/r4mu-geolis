@@ -11,7 +11,6 @@ from shapely.geometry import Point
 
 def calculate_hpc_locations(standorte_gdf, linien_gdf, verkehrs_spalte='dtvw_kfz', max_entfernung=200):
 
-
     """
     Berechnet ein Gewicht für jeden Standort basierend auf der Verkehrsstärke der nächstgelegenen Linie
     und der Entfernung zu dieser Linie. Gewicht wird auf Bereich [0, 1] normalisiert.
@@ -26,6 +25,10 @@ def calculate_hpc_locations(standorte_gdf, linien_gdf, verkehrs_spalte='dtvw_kfz
     - GeoDataFrame mit zusätzlichen Spalten: 'gewicht', 'entfernung_zur_linie', 'keine_linie_im_umkreis'
     """
     # Einheitliches Koordinatensystem
+
+    if verkehrs_spalte not in linien_gdf.columns:
+        verkehrs_spalte = "AverageTrafficVolume"
+
     standorte_gdf = standorte_gdf.to_crs(linien_gdf.crs)
 
     max_verkehr = linien_gdf[verkehrs_spalte].max()
