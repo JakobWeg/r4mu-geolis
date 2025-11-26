@@ -317,6 +317,45 @@ def calculate_share_of_public_home_charging():
 
     print("share_street while beeing at home:", share_street_home_charging, share_street_not_at_home_charging)
 
+
+def transfer_berlin_commercial_events_to_stralsund():
+    print("starting transfer")
+    berlin_events = pd.read_parquet("scenario/Ladeprofile_Wirtschaftsverkehr_parquet/simulierte_ladeevents_2035.parquet")
+
+    energy_col = "energy"
+
+    vehicles_stralsund = 89
+    vehicles_berlin = 890
+
+    seed = 1
+
+    # Zielenergie berechnen
+    total_energy = berlin_events[energy_col].sum()
+    ratio = vehicles_stralsund / vehicles_berlin
+    target_energy = total_energy * ratio
+
+    # Ladeevents zufällig mischen
+    df_shuffled = berlin_events.sample(frac=1, random_state=seed).reset_index(drop=True)
+
+    # Iterativ Events hinzufügen, bis Ziel erreicht ist
+    selected_events = []
+    current_energy = 0
+
+    for _, row in df_shuffled.iterrows():
+        if current_energy + row[energy_col] > target_energy:
+            break
+        selected_events.append(row)
+        current_energy += row[energy_col]
+
+    stralsund_events = pd.DataFrame(selected_events)
+
+    output_path = "scenario/Ladeprofile_Wirtschaftsverkehr_stralsund/stralsund_commercial_events.parquet"
+
+    stralsund_events.to_parquet(output_path, engine="pyarrow", index=False)
+
+    print("transfer done")
+
+
 # Beispielnutzung
 if __name__ == "__main__":
     # charging_events = pd.read_parquet("combined_charging_events.parquet")
@@ -324,8 +363,10 @@ if __name__ == "__main__":
     # combine_csv_to_parquet(r"C:\Users\jakob.wegner\PycharmProjects\simbev\scenarios\r4mu_stralsund_2035\results\default_2025-11-20_161319_simbev_run\LR_Zentr",
     #                        "scenario/Ladeprofile_Privatverkehr_stralsund/combined_charging_events_2035_stralsund.parquet")
     # convert_geodata_for_uc_work(landusepath="data/Reale_Nutzung_2021_Umweltatlas.gpkg", alkispath="data/ALKIS_Berlin_Gebäude.gpkg")
-    filter_points_within_boundary()
+    # filter_points_within_boundary()
     # merge_geometries_to_polygon()
     # cluster_public_data()
     # convert_geodata_for_uc_retail("data/Retailer_parking_lots.gpkg")
     #calculate_share_of_public_home_charging()
+
+    transfer_berlin_commercial_events_to_stralsund()
