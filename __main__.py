@@ -22,7 +22,7 @@ def parse_data(args):
     print("--- reading config file ---")
     parser = cp.ConfigParser()
     scenario_path = pathlib.Path('scenario')
-    cfg_file = pathlib.Path(scenario_path, 'config_stralsund.cfg')
+    cfg_file = pathlib.Path(scenario_path, 'config_office.cfg')
     data_dir = pathlib.Path('data')
 
     if not cfg_file.is_file():
@@ -73,6 +73,8 @@ def parse_data(args):
         'multi_use_concept': parser['basic'].getboolean('multi_use_concept', None),
         'multi_use_group': parser['basic'].get('multi_use_group').split(', '),
         'flexibility_multi_use': parser['basic'].getint('flexibility_multi_use', 0),
+        'use_case_multi_use': parser['basic'].get("use_case_multi_use"),
+        'share_office_parking': parser['basic'].getfloat('share_office_parking'),
         'charge_events_private_path': parser.get('data', 'charging_events_private'),
         'charge_events_commercial_path': parser.get('data', 'charging_events_commercial'),
         'result_dir': result_dir,
@@ -171,8 +173,44 @@ def parse_data(args):
         work_commercial = float(parser.get('uc_params', 'work_weight_commercial'))
         work_industrial = float(parser.get('uc_params', 'work_weight_industrial'))
         buildings_data_file = parser.get('data', 'building_data')
+        office_parking_data_file = parser.get('data', 'office_parking_lots_data')
         work_data = gpd.read_file(pathlib.Path(data_dir, buildings_data_file),
                              engine='pyogrio', use_arrow=True)
+        if config_dict["multi_use_concept"] and config_dict["use_case_multi_use"] == "work":
+            office_parking_data = gpd.read_file(pathlib.Path(data_dir, office_parking_data_file),
+                                 engine='pyogrio', use_arrow=True)
+            office_parking_data["area"] = 1 # office_parking_data.geometry.area
+            #         office_parking_data["geometry"] = office_parking_data["geometry"].centroid
+            config_dict.update({'office_parking_data': office_parking_data})
+
+            # Eliminiere alle Work-punkte mit einem Buffer von 200m um die Office-Loactions
+
+            # 1) In projiziertes CRS (Meter) transformieren, falls noch nicht geschehen
+            meter_crs = "EPSG:25833"  # ETRS89 / UTM zone 33N (für Berlin). Anpassen, falls deine Daten woanders liegen.
+            if office_parking_data.crs is None or work_data.crs is None:
+                raise ValueError(
+                    "Bitte CRS für beide GeoDataFrames setzen (z. B. .set_crs('EPSG:4326') vor dem .to_crs()).")
+
+            office_parking_data_m = office_parking_data.to_crs(meter_crs)
+            work_data_m = work_data.to_crs(meter_crs)
+
+            # 2) 100-m-Buffer um Polygone
+            poly_buffer = office_parking_data_m.copy()
+            poly_buffer["geometry"] = poly_buffer.geometry.buffer(200)
+
+            # 3) Räumlicher Join: finde Punkte, die im Buffer liegen
+            # Hinweis: predicate='within' (oder 'intersects', wenn Punkte genau auf der Grenze mit entfernt werden sollen)
+            pts_in_buffer = gpd.sjoin(
+                work_data_m,
+                poly_buffer[["geometry"]],
+                predicate="within",
+                how="inner"
+            )
+
+            # 4) Diese Punkte aus dem Ursprungspunkte-Datensatz entfernen
+            work_data = work_data_m.loc[~work_data_m.index.isin(pts_in_buffer.index)].copy()
+
+
         work_data = work_data.loc[work_data["cts_demand"].astype(float) != 0]
         work_data = work_data.to_crs(3035)
         work_dict = {'retail': work_retail, 'commercial': work_commercial, 'industrial': work_industrial}
@@ -325,10 +363,15 @@ def run_use_cases(data_dict):
     if data_dict['run_work']:
         uc_name = "work"
         data_dict["results_summary"][uc_name] = {}
-        data_dict["results_summary"][uc_name]["charging_points"], data_dict["results_summary"][uc_name]["energy"], \
-            data_dict["results_summary"][uc_name]["installed_power"] = uc.work(data_dict[uc_name],
-                data_dict)
 
+        if data_dict["multi_use_concept"] and data_dict["use_case_multi_use"] == "work":
+            data_dict["results_summary"][uc_name]["charging_points"], data_dict["results_summary"][uc_name]["energy"], \
+                data_dict["results_summary"][uc_name]["installed_power"], charging_events_public_after_multi_use = uc.work(data_dict[uc_name],
+                    data_dict, office_data=data_dict["office_parking_data"])
+        else:
+            data_dict["results_summary"][uc_name]["charging_points"], data_dict["results_summary"][uc_name]["energy"], \
+                data_dict["results_summary"][uc_name]["installed_power"] = uc.work(data_dict[uc_name],
+                    data_dict)
     if data_dict['run_hpc']:
         uc_name = "hpc"
         data_dict["results_summary"][uc_name] = {}
@@ -338,7 +381,7 @@ def run_use_cases(data_dict):
     if data_dict['run_retail']:
         uc_name = "retail"
         data_dict["results_summary"][uc_name] = {}
-        if data_dict["multi_use_concept"]:
+        if data_dict["multi_use_concept"] and data_dict["use_case_multi_use"] == "retail":
             data_dict["results_summary"][uc_name]["charging_points"], data_dict["results_summary"][uc_name]["energy"], \
                 data_dict["results_summary"][uc_name]["installed_power"], charging_events_public_after_multi_use = (
                 uc.retail(data_dict['retail_parking_lots'],

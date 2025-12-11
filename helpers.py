@@ -324,8 +324,8 @@ def transfer_berlin_commercial_events_to_stralsund():
 
     energy_col = "energy"
 
-    vehicles_stralsund = 89
-    vehicles_berlin = 890
+    vehicles_stralsund = 1055
+    vehicles_berlin = 89373
 
     seed = 1
 
@@ -349,7 +349,7 @@ def transfer_berlin_commercial_events_to_stralsund():
 
     stralsund_events = pd.DataFrame(selected_events)
 
-    output_path = "scenario/Ladeprofile_Wirtschaftsverkehr_stralsund/stralsund_commercial_events.parquet"
+    output_path = "scenario/Ladeprofile_Wirtschaftsverkehr_stralsund/stralsund_commercial_events_2035.parquet"
 
     stralsund_events.to_parquet(output_path, engine="pyarrow", index=False)
 

@@ -440,7 +440,7 @@ def home(home_data: gpd.GeoDataFrame, uc_dict, mode):
     return (int(charging_locations["charging_points"].sum()), int(charging_events["energy"].sum()),
             int((charging_locations["average_charging_capacity"]*charging_locations["charging_points"]).sum()))
 
-def work(work_data, uc_dict, timestep=15):
+def work(work_data, uc_dict, office_data=None, timestep=15):
     print("distributing uc work...")
     uc_id = "work"
     print("Use case: " + uc_id)
@@ -451,18 +451,83 @@ def work(work_data, uc_dict, timestep=15):
         .reset_index()
     )
 
+    charging_events['Office'] = np.random.choice([True, False], size=len(charging_events),
+                                                 p=[uc_dict["share_office_parking"],
+                                                    1 - uc_dict["share_office_parking"]])
+
     # filter houses by region
     # in_region_bool = home_data["geometry"].within(uc_dict["boundaries"].iloc[0,0])
     # in_region = home_data.loc[in_region_bool].copy()
-    in_region = work_data
-    # in_region = in_region.iloc[:800]
-    (
-        charging_locations_work,
-        located_charging_events,
-    ) = uc_helpers.distribute_charging_events(
-        in_region, charging_events, weight_column="area", simulation_steps=2000,
-        rng=uc_dict["random_seed"]
-    )
+
+    if uc_dict["multi_use_concept"] and uc_dict["use_case_multi_use"] == "work":
+
+        in_region_not_office = work_data
+        in_region_office = office_data
+        # in_region = in_region.iloc[:800]
+
+        charging_events_office = charging_events[charging_events["Office"] == True].reset_index(drop=True)
+
+        charging_events_not_office = charging_events[charging_events["Office"] == False].reset_index(drop=True)
+
+        (
+            charging_locations_work_office,
+            located_charging_events_office,
+            availability_mask_office
+        ) = uc_helpers.distribute_charging_events(
+            in_region_office, charging_events_office, weight_column="area", simulation_steps=2000,
+            rng=uc_dict["random_seed"], return_mask=True
+        )
+
+        (
+            charging_locations_work_not_office,
+            located_charging_events_not_office,
+            availability_mask_not_office
+        ) = uc_helpers.distribute_charging_events(
+            in_region_not_office, charging_events_not_office, weight_column="area", simulation_steps=2000,
+            rng=uc_dict["random_seed"], return_mask=True
+        )
+
+        # Depot Ladeevents in den Nachtstunden (Mo-Sa zwischen 21:00 und 8:00 Uhr)
+        charging_events_street = uc_dict["charging_event"].loc[
+            uc_dict["charging_event"]["charging_use_case"].isin(["street"]) & uc_dict["charging_event"]["Type"].isin(uc_dict["multi_use_group"])
+        ]
+        charging_events_public = charging_events_street.reset_index()
+
+        # Verteilung der Street-Ladeevents auf Retail-Standorte
+        charging_locations_work_after_multi_use, located_public_events = uc_helpers.distribute_charging_events(
+            charging_locations_work_office, charging_events_public, weight_column="area", simulation_steps=2000,
+            rng=uc_dict["random_seed"], fill_existing_only=True, availability_mask=availability_mask_office,
+            flexibility_multi_use=uc_dict["flexibility_multi_use"]
+        ) # charging_events_depot austauschen gegen depot_night_events
+
+        located_public_events_assigned = located_public_events[located_public_events["assigned_location"].notna()]
+
+        located_public_events_assigned["multi_use"] = True
+
+        located_charging_events = pd.concat([located_charging_events_not_office, located_charging_events_office])
+
+        located_charging_events["multi_use"] = False
+
+        # Kombiniere Retail- und Depot-Ladeevents
+        located_charging_events = pd.concat([located_charging_events, located_public_events_assigned], ignore_index=True)
+
+        charging_events_public_no_multi_use_possible = located_public_events[located_public_events["assigned_location"].isna()].reset_index()
+
+        charging_locations_work_office = charging_locations_work_office.to_crs( charging_locations_work_not_office.crs)
+        charging_locations_work = pd.concat([charging_locations_work_not_office, charging_locations_work_office])
+
+    else:
+        in_region = work_data
+
+        (
+            charging_locations_work,
+            located_charging_events,
+            availability_mask
+        ) = uc_helpers.distribute_charging_events(
+            in_region, charging_events, weight_column="area", simulation_steps=2000,
+            rng=uc_dict["random_seed"], return_mask=True
+        )
+
 
     # Merge Chargin_events and Locations
     charging_locations_work["index"] = charging_locations_work.index
@@ -482,7 +547,13 @@ def work(work_data, uc_dict, timestep=15):
     charging_locations_work["location_id"] = uc_helpers.get_id(uc_id, pd.Series(charging_locations_work.index).astype(int))
 
     charging_locations = charging_locations_work[uc_dict["columns_output_locations"]]
-    located_charging_events_gdf = located_charging_events_gdf[uc_dict["columns_output_chargingevents"]]
+    # located_charging_events_gdf = located_charging_events_gdf[uc_dict["columns_output_chargingevents"]]
+
+    if uc_dict["multi_use_concept"] and uc_dict["use_case_multi_use"] == "work":
+        keys = uc_dict["columns_output_chargingevents"] + ["multi_use"]
+        located_charging_events_gdf = located_charging_events_gdf[keys]
+    else:
+        located_charging_events_gdf = located_charging_events_gdf[uc_dict["columns_output_chargingevents"]]
 
     charging_locations = charging_locations[charging_locations["charging_points"] != 0]
 
@@ -491,7 +562,13 @@ def work(work_data, uc_dict, timestep=15):
 
     print(uc_id, "Anzahl der Ladepunkte: ", charging_locations["charging_points"].sum())
     print("distribution of work-charging-points successful")
-    return (int(charging_locations["charging_points"].sum()), int(charging_events["energy"].sum()),
+
+    if uc_dict["multi_use_concept"] and uc_dict["use_case_multi_use"] == "work":
+        return (int(charging_locations["charging_points"].sum()), int(located_charging_events_gdf["energy"].sum()),
+            int((charging_locations["average_charging_capacity"]*charging_locations["charging_points"]).sum()),
+                charging_events_public_no_multi_use_possible)
+    else:
+        return (int(charging_locations["charging_points"].sum()), int(charging_events["energy"].sum()),
             int((charging_locations["average_charging_capacity"]*charging_locations["charging_points"]).sum()))
 
 def retail(retail_data: gpd.GeoDataFrame, uc_dict):
@@ -560,7 +637,7 @@ def retail(retail_data: gpd.GeoDataFrame, uc_dict):
         rng=uc_dict["random_seed"], return_mask=True
     )
 
-    if uc_dict["multi_use_concept"]:
+    if uc_dict["multi_use_concept"] and uc_dict["use_case_multi_use"] == "retail":
         print("multi-use-concept activated")
 
         # Depot Ladeevents in den Nachtstunden (Mo-Sa zwischen 21:00 und 8:00 Uhr)
@@ -605,7 +682,7 @@ def retail(retail_data: gpd.GeoDataFrame, uc_dict):
     charging_locations_retail["location_id"] = uc_helpers.get_id(uc_id, pd.Series(charging_locations_retail.index).astype(int))
 
     charging_locations = charging_locations_retail[uc_dict["columns_output_locations"]]
-    if uc_dict["multi_use_concept"]:
+    if uc_dict["multi_use_concept"] and uc_dict["use_case_multi_use"] == "retail":
         keys = uc_dict["columns_output_chargingevents"] + ["multi_use"]
         located_charging_events_gdf = located_charging_events_gdf[keys]
     else:
@@ -623,7 +700,7 @@ def retail(retail_data: gpd.GeoDataFrame, uc_dict):
     print(uc_id, "Anzahl der Ladepunkte: ", charging_locations["charging_points"].sum())
     print("distribution of work-charging-points successful")
 
-    if uc_dict["multi_use_concept"]:
+    if uc_dict["multi_use_concept"] and uc_dict["use_case_multi_use"] == "retail":
         return (int(charging_locations["charging_points"].sum()), int(located_charging_events["energy"].sum()),
                 int((charging_locations["average_charging_capacity"]*charging_locations["charging_points"]).sum()),
                 charging_events_public_no_multi_use_possible)
