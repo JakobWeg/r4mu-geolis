@@ -194,9 +194,6 @@ def get_id(use_case_id, location_id):
 
     return ids.values.astype(int)
 
-#todo: mark charging events that got transfered to retail-parking
-#todo: transfer multi-use events just from commercial street to retail
-
 def distribute_charging_events(
     locations: gpd.GeoDataFrame,
     events: pd.DataFrame,
@@ -210,7 +207,8 @@ def distribute_charging_events(
     flexibility_multi_use: int = 0,
     return_mask: bool = False,
     seed: int = 1,
-    additional_street_input: bool = False
+    additional_street_input: bool = False,
+    location_id_start: int = 0
 ):
     """
     Distributes charging events to locations with optional random assignment.
@@ -224,7 +222,7 @@ def distribute_charging_events(
         print("Using the 'fill_existing_only' method: Only existing charging points will be filled.")
         return distribute_charging_events_fill_existing_only(
             locations, events, weight_column, simulation_steps, flexibility_multi_use, rng, availability_mask,
-            additional_street_input= additional_street_input
+            additional_street_input= additional_street_input, location_id_start=location_id_start
         )
 
     # if home_street:
@@ -239,7 +237,9 @@ def distribute_charging_events(
     probabilities = locations[weight_column].values / locations[weight_column].sum()
 
     # Initial setup
+
     locations = locations.reset_index().copy()
+
     locations["charging_points"] = 0
     locations["average_charging_capacity"] = 0.0  # in kW
     assigned_locations = np.full(n_events, np.nan)
@@ -305,7 +305,9 @@ def distribute_charging_events(
     locations["average_charging_capacity"] = locations["average_charging_capacity"].astype(int)
 
     events = events.copy()
-    events["assigned_location"] = assigned_locations
+    events["assigned_location"] = assigned_locations + location_id_start
+
+    locations.index = locations.index + location_id_start
 
     if return_mask:
         return locations, events, availability
@@ -320,7 +322,8 @@ def distribute_charging_events_fill_existing_only(
     max_shift_steps: int = 0,
     rng: np.random.Generator = None,
     availability_mask: np.array = None,
-    additional_street_input: bool = False
+    additional_street_input: bool = False,
+    location_id_start: int = 0
 ):
     """
     Distributes charging events to existing locations with available charging points.
@@ -338,6 +341,7 @@ def distribute_charging_events_fill_existing_only(
 
     # Initial setup
     locations = locations.reset_index().copy()
+    # locations = locations.copy()
     locations["charging_points"] = locations["charging_points"].astype(int)  # Ensure the column is integer
     assigned_locations = np.full(n_events, np.nan)
 
@@ -387,7 +391,10 @@ def distribute_charging_events_fill_existing_only(
 
     # Mark locations with assigned events
     events = events.copy()
-    events["assigned_location"] = assigned_locations
+
+    events["assigned_location"] = assigned_locations + location_id_start
+
+    locations.index = locations.index + location_id_start
 
     #return assigned_locations, events
     return locations, events

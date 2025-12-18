@@ -451,7 +451,9 @@ def work(work_data, uc_dict, office_data=None, timestep=15):
         .reset_index()
     )
 
-    charging_events['Office'] = np.random.choice([True, False], size=len(charging_events),
+    charging_events = charging_events
+
+    charging_events['office'] = np.random.choice([True, False], size=len(charging_events),
                                                  p=[uc_dict["share_office_parking"],
                                                     1 - uc_dict["share_office_parking"]])
 
@@ -462,12 +464,14 @@ def work(work_data, uc_dict, office_data=None, timestep=15):
     if uc_dict["multi_use_concept"] and uc_dict["use_case_multi_use"] == "work":
 
         in_region_not_office = work_data
+        in_region_not_office["office"] = False
         in_region_office = office_data
+        in_region_office["office"] = True
         # in_region = in_region.iloc[:800]
 
-        charging_events_office = charging_events[charging_events["Office"] == True].reset_index(drop=True)
+        charging_events_office = charging_events[charging_events["office"] == True].reset_index(drop=True)
 
-        charging_events_not_office = charging_events[charging_events["Office"] == False].reset_index(drop=True)
+        charging_events_not_office = charging_events[charging_events["office"] == False].reset_index(drop=True)
 
         (
             charging_locations_work_office,
@@ -475,9 +479,10 @@ def work(work_data, uc_dict, office_data=None, timestep=15):
             availability_mask_office
         ) = uc_helpers.distribute_charging_events(
             in_region_office, charging_events_office, weight_column="area", simulation_steps=2000,
-            rng=uc_dict["random_seed"], return_mask=True
+            rng=uc_dict["random_seed"], return_mask=True, location_id_start= len(in_region_not_office)
         )
-
+        charging_locations_work_office["office"] = True
+        located_charging_events_office["office"] = True
         (
             charging_locations_work_not_office,
             located_charging_events_not_office,
@@ -486,19 +491,24 @@ def work(work_data, uc_dict, office_data=None, timestep=15):
             in_region_not_office, charging_events_not_office, weight_column="area", simulation_steps=2000,
             rng=uc_dict["random_seed"], return_mask=True
         )
+        charging_locations_work_not_office["office"] = False
+        located_charging_events_not_office["office"] = False
 
         # Depot Ladeevents in den Nachtstunden (Mo-Sa zwischen 21:00 und 8:00 Uhr)
         charging_events_street = uc_dict["charging_event"].loc[
             uc_dict["charging_event"]["charging_use_case"].isin(["street"]) & uc_dict["charging_event"]["Type"].isin(uc_dict["multi_use_group"])
         ]
         charging_events_public = charging_events_street.reset_index()
+        charging_events_public["office"] = True
 
-        # Verteilung der Street-Ladeevents auf Retail-Standorte
+        # Verteilung der Street-Ladeevents auf Retail-Standorte (Multi-Use)
         charging_locations_work_after_multi_use, located_public_events = uc_helpers.distribute_charging_events(
             charging_locations_work_office, charging_events_public, weight_column="area", simulation_steps=2000,
             rng=uc_dict["random_seed"], fill_existing_only=True, availability_mask=availability_mask_office,
-            flexibility_multi_use=uc_dict["flexibility_multi_use"]
+            flexibility_multi_use=uc_dict["flexibility_multi_use"], location_id_start= len(in_region_not_office)
         ) # charging_events_depot austauschen gegen depot_night_events
+
+
 
         located_public_events_assigned = located_public_events[located_public_events["assigned_location"].notna()]
 
@@ -512,6 +522,7 @@ def work(work_data, uc_dict, office_data=None, timestep=15):
         located_charging_events = pd.concat([located_charging_events, located_public_events_assigned], ignore_index=True)
 
         charging_events_public_no_multi_use_possible = located_public_events[located_public_events["assigned_location"].isna()].reset_index()
+        charging_events_public_no_multi_use_possible["office"] = False
 
         charging_locations_work_office = charging_locations_work_office.to_crs( charging_locations_work_not_office.crs)
         charging_locations_work = pd.concat([charging_locations_work_not_office, charging_locations_work_office])
@@ -540,20 +551,24 @@ def work(work_data, uc_dict, office_data=None, timestep=15):
         located_charging_events, geometry="geometry"
     )
     located_charging_events_gdf.set_crs(3035)
+    located_charging_events_gdf = located_charging_events_gdf.rename(columns={"office_x": "office"})
 
     # generate_ids and reduce columns
     located_charging_events_gdf["location_id"] = uc_helpers.get_id(uc_id, located_charging_events_gdf[
         "assigned_location"].astype(int))
     charging_locations_work["location_id"] = uc_helpers.get_id(uc_id, pd.Series(charging_locations_work.index).astype(int))
 
-    charging_locations = charging_locations_work[uc_dict["columns_output_locations"]]
+    # charging_locations = charging_locations_work[uc_dict["columns_output_locations"]]
     # located_charging_events_gdf = located_charging_events_gdf[uc_dict["columns_output_chargingevents"]]
 
     if uc_dict["multi_use_concept"] and uc_dict["use_case_multi_use"] == "work":
-        keys = uc_dict["columns_output_chargingevents"] + ["multi_use"]
-        located_charging_events_gdf = located_charging_events_gdf[keys]
+        keys_events = uc_dict["columns_output_chargingevents"] + ["multi_use", "office"]
+        keys_locations = uc_dict["columns_output_locations"] + ["office"]
+        located_charging_events_gdf = located_charging_events_gdf[keys_events]
+        charging_locations = charging_locations_work[keys_locations]
     else:
         located_charging_events_gdf = located_charging_events_gdf[uc_dict["columns_output_chargingevents"]]
+        charging_locations = charging_locations_work[uc_dict["columns_output_locations"]]
 
     charging_locations = charging_locations[charging_locations["charging_points"] != 0]
 
@@ -564,8 +579,22 @@ def work(work_data, uc_dict, office_data=None, timestep=15):
     print("distribution of work-charging-points successful")
 
     if uc_dict["multi_use_concept"] and uc_dict["use_case_multi_use"] == "work":
-        return (int(charging_locations["charging_points"].sum()), int(located_charging_events_gdf["energy"].sum()),
-            int((charging_locations["average_charging_capacity"]*charging_locations["charging_points"]).sum()),
+        charging_locations_office = charging_locations.loc[charging_locations["office"] == True]
+        located_charging_events_gdf_office = located_charging_events_gdf.loc[located_charging_events_gdf["office"] == True]
+
+        charging_locations_not_office = charging_locations.loc[charging_locations["office"] == False]
+        located_charging_events_gdf_not_office = located_charging_events_gdf.loc[located_charging_events_gdf["office"] == False]
+
+        utility.save(charging_locations, uc_id, "charging-locations-office-spezial", uc_dict)
+        utility.save(located_charging_events_gdf, uc_id, "charging-events-office-spezial", uc_dict)
+        utility.save(charging_locations_not_office, uc_id, "charging-locations-not_office", uc_dict)
+        utility.save(located_charging_events_gdf_not_office, uc_id, "charging-events-not_office", uc_dict)
+
+    if uc_dict["multi_use_concept"] and uc_dict["use_case_multi_use"] == "work":
+        return (int(charging_locations_office["charging_points"].sum()), int(located_charging_events_gdf_office["energy"].sum()),
+            int((charging_locations_office["average_charging_capacity"]*charging_locations_office["charging_points"]).sum()),
+                int(charging_locations_not_office["charging_points"].sum()), int(located_charging_events_gdf_not_office["energy"].sum()),
+                int((charging_locations_not_office["average_charging_capacity"] * charging_locations["charging_points"]).sum()),
                 charging_events_public_no_multi_use_possible)
     else:
         return (int(charging_locations["charging_points"].sum()), int(charging_events["energy"].sum()),

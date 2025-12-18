@@ -22,7 +22,8 @@ def parse_data(args):
     print("--- reading config file ---")
     parser = cp.ConfigParser()
     scenario_path = pathlib.Path('scenario')
-    cfg_file = pathlib.Path(scenario_path, 'config_office.cfg')
+    # hier muss die Config angepasst werden
+    cfg_file = pathlib.Path(scenario_path, args.config_file)
     data_dir = pathlib.Path('data')
 
     if not cfg_file.is_file():
@@ -69,7 +70,6 @@ def parse_data(args):
         'scenario_name': args.scenario,
         'seed': rng_seed,
         'random_seed': rng,
-        'mode': args.mode,
         'multi_use_concept': parser['basic'].getboolean('multi_use_concept', None),
         'multi_use_group': parser['basic'].get('multi_use_group').split(', '),
         'flexibility_multi_use': parser['basic'].getint('flexibility_multi_use', 0),
@@ -361,14 +361,20 @@ def run_use_cases(data_dict):
                 data_dict, mode="apartment")
 
     if data_dict['run_work']:
-        uc_name = "work"
-        data_dict["results_summary"][uc_name] = {}
 
         if data_dict["multi_use_concept"] and data_dict["use_case_multi_use"] == "work":
-            data_dict["results_summary"][uc_name]["charging_points"], data_dict["results_summary"][uc_name]["energy"], \
-                data_dict["results_summary"][uc_name]["installed_power"], charging_events_public_after_multi_use = uc.work(data_dict[uc_name],
+            uc_name_office = "work_office"
+            uc_name_not_office = "work_not_office"
+            data_dict["results_summary"][uc_name_office] = {}
+            data_dict["results_summary"][uc_name_not_office] = {}
+            (data_dict["results_summary"][uc_name_office]["charging_points"], data_dict["results_summary"][uc_name_office]["energy"], \
+                data_dict["results_summary"][uc_name_office]["installed_power"],data_dict["results_summary"][uc_name_not_office]["charging_points"],
+             data_dict["results_summary"][uc_name_not_office]["energy"], \
+                data_dict["results_summary"][uc_name_not_office]["installed_power"], charging_events_public_after_multi_use) = uc.work(data_dict["work"],
                     data_dict, office_data=data_dict["office_parking_data"])
         else:
+            uc_name = "work"
+            data_dict["results_summary"][uc_name] = {}
             data_dict["results_summary"][uc_name]["charging_points"], data_dict["results_summary"][uc_name]["energy"], \
                 data_dict["results_summary"][uc_name]["installed_power"] = uc.work(data_dict[uc_name],
                     data_dict)
@@ -423,9 +429,7 @@ def main():
     parser = argparse.ArgumentParser(description='Tool for allocation of charging infrastructure')
     parser.add_argument('scenario', nargs='?',
                            help='Set name of the scenario directory', default="scenario")
-    parser.add_argument('--mode', default="default", type=str, help="Choose simulation mode: default "
-                                                                    "(using SimBEV inputs) or potential "
-                                                                    "(returning all potential spots in the region)")
+    parser.add_argument('--config_file', default="config_office.cfg", type=str)
     p_args = parser.parse_args()
 
     data = parse_default_data(p_args)
