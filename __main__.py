@@ -172,9 +172,9 @@ def parse_data(args):
         work_retail = float(parser.get('uc_params', 'work_weight_retail'))
         work_commercial = float(parser.get('uc_params', 'work_weight_commercial'))
         work_industrial = float(parser.get('uc_params', 'work_weight_industrial'))
-        buildings_data_file = parser.get('data', 'building_data')
+        work_data_file = parser.get('data', 'work_data')
         office_parking_data_file = parser.get('data', 'office_parking_lots_data')
-        work_data = gpd.read_file(pathlib.Path(data_dir, buildings_data_file),
+        work_data = gpd.read_file(pathlib.Path(data_dir, work_data_file),
                              engine='pyogrio', use_arrow=True)
         if config_dict["multi_use_concept"] and config_dict["use_case_multi_use"] == "work":
             office_parking_data = gpd.read_file(pathlib.Path(data_dir, office_parking_data_file),
@@ -211,7 +211,7 @@ def parse_data(args):
             work_data = work_data_m.loc[~work_data_m.index.isin(pts_in_buffer.index)].copy()
 
 
-        work_data = work_data.loc[work_data["cts_demand"].astype(float) != 0]
+        # work_data = work_data.loc[work_data["cts_demand"].astype(float) != 0]
         work_data = work_data.to_crs(3035)
         work_dict = {'retail': work_retail, 'commercial': work_commercial, 'industrial': work_industrial}
         config_dict.update({'work': work_data, 'work_dict': work_dict})
@@ -429,7 +429,7 @@ def main():
     parser = argparse.ArgumentParser(description='Tool for allocation of charging infrastructure')
     parser.add_argument('scenario', nargs='?',
                            help='Set name of the scenario directory', default="scenario")
-    parser.add_argument('--config_file', default="config_office.cfg", type=str)
+    parser.add_argument('--config_file', default="config.cfg", type=str)
     p_args = parser.parse_args()
 
     data = parse_default_data(p_args)
