@@ -72,6 +72,7 @@ def postprocess_public_demands(charging_locations: gpd.GeoDataFrame, located_cha
                 # Ladevent umverteilen
                 located_charging_events.at[idx, "location_id"] = new_location_id
                 located_charging_events.at[idx, "mode"] = "street"
+                located_charging_events.at[idx, "geometry"] = loc_with_free_capacity.geometry
 
                 # Maske updaten
                 # Abziehen der belegten Zeitschritte von der ursprünglichen home_street Location
@@ -216,7 +217,7 @@ def distribute_charging_events(
     If 'fill_existing_only' is True, only existing charging points are filled.
     """
     # reset seed so that the locations are always the same
-    rng = np.random.default_rng(seed)
+    #rng = np.random.default_rng(seed)
 
     if fill_existing_only:
         print("Using the 'fill_existing_only' method: Only existing charging points will be filled.")

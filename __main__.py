@@ -250,7 +250,7 @@ def parse_car_data(args, data_dict):
 
     dataframes = []
 
-    for file in os.listdir(ts_private_path):
+    for file in sorted(os.listdir(ts_private_path)):
         if file.endswith(".parquet"):
             file_path = os.path.join(ts_private_path, file)
             df = pd.read_parquet(file_path)  # Read the Parquet file

@@ -143,8 +143,10 @@ def public(
         load = {lid: 0 for lid in all_locations}
         max_load = {lid: 0 for lid in all_locations}
 
-        # Verfügbarkeits-Heap: nur Locations mit cap>0 kommen rein
-        # (Eintrag: (current_load, location_id); lazy updates bei Änderungen)
+        # Max-Heap für Konsolidierung: Standort mit höchster aktueller Last bevorzugen.
+        # Eintrag: (-current_load, location_id); lazy updates.
+        # Dadurch werden Events auf möglichst wenige Standorte konzentriert,
+        # sodass ungenutzte Standorte (max_load=0) wegfallen.
         availQ = [(0, lid) for lid in all_locations if cap.get(lid, 0) > 0]
         heapq.heapify(availQ)
 
@@ -164,9 +166,9 @@ def public(
             while endQ and endQ[0][0] <= until_time:
                 end_t, lid = heapq.heappop(endQ)
                 load[lid] -= 1
-                # Falls nach dem Freigeben noch Kapazität frei: neuen (akt. load, lid) eintragen
+                # Falls nach dem Freigeben noch Kapazität frei: neuen (-load, lid) eintragen
                 if load[lid] < cap.get(lid, 0):
-                    heapq.heappush(availQ, (load[lid], lid))
+                    heapq.heappush(availQ, (-load[lid], lid))
 
         for idx in ev_idx:
             start = int(events.at[idx, "event_start"])
@@ -178,34 +180,30 @@ def public(
 
             chosen = None
 
-            # 2) Bevorzugt: Originalstandort, falls dort freie Kapazität
-            if cap.get(orig, 0) > 0 and load[orig] < cap[orig]:
-                chosen = orig
-            else:
-                # 3) Sonst: Standort mit minimaler aktueller Belegung aus availQ (lazy updates)
-                while availQ:
-                    cand_load, cand = heapq.heappop(availQ)
-                    # veraltete Einträge überspringen
-                    if cand_load != load[cand]:
-                        continue
-                    # nur nehmen, wenn noch Kapazität frei
-                    if load[cand] < cap.get(cand, 0):
-                        chosen = cand
-                        break
-                # wenn keiner frei ist -> unserved
+            # 2) Standort mit höchster aktueller Last und freier Kapazität (Max-Heap, lazy updates)
+            while availQ:
+                neg_cand_load, cand = heapq.heappop(availQ)
+                # veraltete Einträge überspringen
+                if neg_cand_load != -load[cand]:
+                    continue
+                # nur nehmen, wenn noch Kapazität frei
+                if load[cand] < cap.get(cand, 0):
+                    chosen = cand
+                    break
+            # wenn keiner frei ist -> unserved
 
             if chosen is None:
                 events.at[idx, "unserved"] = True
                 continue
 
-            # 4) Zuweisen
+            # 3) Zuweisen
             load[chosen] += 1
             max_load[chosen] = max(max_load[chosen], load[chosen])
             heapq.heappush(endQ, (end, chosen))
 
             # Standort bleibt ggf. weiter verfügbar -> neuen Zustand in availQ schreiben
             if load[chosen] < cap.get(chosen, 0):
-                heapq.heappush(availQ, (load[chosen], chosen))
+                heapq.heappush(availQ, (-load[chosen], chosen))
 
             events.at[idx, "assigned_location_id"] = chosen
             events.at[idx, "was_reassigned"] = (chosen != orig)
@@ -216,10 +214,15 @@ def public(
         locs = locs.copy()
         locs["charging_points"] = locs["location_id"].map(peak_series).fillna(0).astype(int)
 
-        # 6) Überschreiben der location_id nur, wenn zugewiesen (nicht für unserved)
+        # 6) Überschreiben der location_id und Geometrie auf den zugewiesenen Standort (nicht für unserved)
         mask_assigned = events["assigned_location_id"].notna()
         events.loc[mask_assigned, "location_id"] = events.loc[mask_assigned, "assigned_location_id"].astype(
             events["location_id"].dtype)
+        # Geometrie der Events auf die Koordinaten des zugewiesenen Standorts aktualisieren,
+        # da nach dem Max-Heap-Reassignment location_id und Geometrie sonst auseinanderfallen.
+        loc_geom_map = locs.set_index("location_id")["geometry"]
+        new_geom = events.loc[mask_assigned, "location_id"].map(loc_geom_map)
+        events.loc[mask_assigned, "geometry"] = new_geom.values
 
         # Outputs wie gehabt
         charging_locations = locs[locs["charging_points"] > 0].reset_index(drop=True)
@@ -657,13 +660,16 @@ def retail(retail_data: gpd.GeoDataFrame, uc_dict):
 
     in_region = retail_data[cols]
     in_region = in_region.loc[in_region["area"] > 100]
+    in_region = in_region.sort_values("id_0").reset_index(drop=True)
+    # Eigener RNG mit festem Seed: Retail-Standorte sind szenariounabhängig deterministisch
+    rng_retail = np.random.default_rng(uc_dict["seed"])
     (
         charging_locations_retail,
         located_charging_events,
         availability_mask,
     ) = uc_helpers.distribute_charging_events(
         in_region, charging_events, weight_column="area", simulation_steps=2000,
-        rng=uc_dict["random_seed"], return_mask=True
+        rng=rng_retail, return_mask=True
     )
 
     if uc_dict["multi_use_concept"] and uc_dict["use_case_multi_use"] == "retail":
