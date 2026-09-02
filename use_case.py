@@ -7,7 +7,9 @@ import math
 import use_case_helpers as uc_helpers
 import heapq
 
-def hpc(hpc_data: gpd.GeoDataFrame, uc_dict, timestep=15):
+def hpc(hpc_data: gpd.GeoDataFrame, uc_dict, timestep=15, uc_id="hpc", weight_column="gewicht",
+        charging_use_case="urban_fast", exclude_shopping=True, simulation_steps=2000,
+        existing_points_column=None, existing_capacity_column=None):
     """
     Calculate placements and energy distribution for use case hpc.
 
@@ -17,37 +19,41 @@ def hpc(hpc_data: gpd.GeoDataFrame, uc_dict, timestep=15):
         contains basic run info like region boundary and save directory
     :param timestep: int
         time step of the simbev input series, default: 15 (minutes)
+    :param uc_id: str
+        use case id used for output filenames and location ids; must be a key
+        in use_case_helpers.get_id's use_case_map
+    :param weight_column: str
+        column in hpc_data used as sampling weight (Berlin: pre-computed
+        "gewicht" from utility.calculate_hpc_locations; data_DE candidates
+        already ship a "weight" column)
+    :param charging_use_case: str
+        value of charging_use_case to place ("urban_fast" or "highway_fast"
+        for the DE urban/highway HPC split)
+    :param exclude_shopping: bool
+        exclude events parked at "shopping" locations (handled by retail()
+        instead); only relevant for the urban_fast case
     """
-    uc_id = "hpc"
-    print("Use case: ", uc_id)
 
-    # charging_events = uc_dict["charging_event"].loc[
-    #     uc_dict["charging_event"]["charging_use_case"].isin(["urban_fast"])]
-
-    charging_events = (
-        uc_dict["charging_event"]
-        .loc[
-            uc_dict["charging_event"]["charging_use_case"].isin(["urban_fast"])
-            & ~uc_dict["charging_event"]["location"].isin(["shopping"])
-        ]
-        .reset_index()
-    )
+    mask = uc_dict["charging_event"]["charging_use_case"].isin([charging_use_case])
+    if exclude_shopping:
+        mask &= ~uc_dict["charging_event"]["location"].isin(["shopping"])
+    charging_events = uc_dict["charging_event"].loc[mask].reset_index()
 
     in_region = hpc_data
     # in_region = in_region.iloc[:800]
 
     num_hpc = charging_events.loc[
-        charging_events["charging_use_case"] == "urban_fast"
+        charging_events["charging_use_case"] == charging_use_case
     ].shape[0]
-    # num_hpc = charging_events.loc[charging_events["charging_use_case"].within(["urban_fast", "highway_fast"])]
 
     if num_hpc > 0:
         (
             charging_locations_hpc,
             located_charging_events,
         ) = uc_helpers.distribute_charging_events(
-            in_region, charging_events, weight_column="gewicht", simulation_steps=2000,
-            rng=uc_dict["random_seed"])
+            in_region, charging_events, weight_column=weight_column, simulation_steps=simulation_steps,
+            rng=uc_dict["random_seed"], existing_points_column=existing_points_column,
+            existing_capacity_column=existing_capacity_column)
 
         # Merge Chargin_events and Locations
         charging_locations_hpc["index"] = charging_locations_hpc.index
@@ -71,12 +77,9 @@ def hpc(hpc_data: gpd.GeoDataFrame, uc_dict, timestep=15):
         utility.save(charging_locations, uc_id, "charging-locations", uc_dict)
         utility.save(located_charging_events_gdf, uc_id, "charging-events", uc_dict)
 
-        print(uc_id, "Anzahl der Ladepunkte: ", charging_locations["charging_points"].sum())
-        print("distribution of hpc-charging-points successful")
         return (int(charging_locations["charging_points"].sum()), int(charging_events["energy"].sum()),
                 int((charging_locations["average_charging_capacity"] * charging_locations["charging_points"]).sum()))
     else:
-        print("No hpc charging in timeseries")
         return 0, 0, 0
 
 
@@ -85,9 +88,11 @@ def public(
     public_data_home_street: gpd.GeoDataFrame,
     uc_dict,
     charging_locations_public_after_multi_use: pd.DataFrame = None,
+    simulation_steps=2000,
+    existing_points_column=None,
+    existing_capacity_column=None,
 ):
     uc_id = "public"
-    print("Use case: " + uc_id)
     charging_events_public = (
         uc_dict["charging_event"]
         .loc[uc_dict["charging_event"]["charging_use_case"] == "street"]
@@ -95,7 +100,6 @@ def public(
     )
 
     if uc_dict["multi_use_concept"]:
-        print("multi-use-consepts activated")
 
         if uc_dict["multi_use_group"] == ['Private', 'Commercial']:
             charging_events = charging_locations_public_after_multi_use
@@ -245,14 +249,20 @@ def public(
 
             in_region_home_street = in_region_home_street.rename(columns={'households_total': 'Weight'})
             in_region_not_home_street = in_region_not_home_street.rename(columns={'@id': 'id'})
+            # carry existing-infrastructure and candidate-identity columns
+            # through the fixed column-selections below if present (see
+            # existing_infrastructure.py / data_de_candidates.py)
+            extra_cols = [c for c in (existing_points_column, existing_capacity_column, "candidate_uid")
+                          if c and c in in_region_not_home_street.columns]
+            home_extra_cols = [c for c in ("candidate_uid",) if c in in_region_home_street.columns]
             if uc_dict["additional_public_input"]:
-                in_region_home_street = in_region_home_street[["Weight", "charging_points", "average_charging_capacity", "geometry"]]
-                in_region_not_home_street = in_region_not_home_street[["Weight", "charging_points", "average_charging_capacity", "geometry"]]
+                in_region_home_street = in_region_home_street[["Weight", "charging_points", "average_charging_capacity", "geometry"] + home_extra_cols]
+                in_region_not_home_street = in_region_not_home_street[["Weight", "charging_points", "average_charging_capacity", "geometry"] + extra_cols]
             else:
-                in_region_home_street = in_region_home_street[["Weight", "geometry"]]
+                in_region_home_street = in_region_home_street[["Weight", "geometry"] + home_extra_cols]
                 if "Category_Weight" in in_region_not_home_street.columns:
                     in_region_not_home_street = in_region_not_home_street.rename(columns={'Category_Weight': 'Weight'})
-                in_region_not_home_street = in_region_not_home_street[["Weight", "geometry"]]
+                in_region_not_home_street = in_region_not_home_street[["Weight", "geometry"] + extra_cols]
             in_region_home_street["mode"] = "home_street"
             in_region_not_home_street["mode"] = "not_home_street"
 
@@ -272,7 +282,7 @@ def public(
             in_region[in_region["mode"] == "home_street"],
             charging_events_home_street,
             weight_column="Weight",
-            simulation_steps=2000,
+            simulation_steps=simulation_steps,
             rng=uc_dict["random_seed"],
             # fill_existing_only=fill_existing_only,
             fill_existing_first=True,
@@ -288,12 +298,14 @@ def public(
             in_region[in_region["mode"] == "not_home_street"],
             charging_events_not_home_street,
             weight_column="Weight",
-            simulation_steps=2000,
+            simulation_steps=simulation_steps,
             rng=uc_dict["random_seed"],
             #fill_existing_only=fill_existing_only,
             fill_existing_first=True,
-            additional_street_input=bool(uc_dict["additional_public_input"])
+            additional_street_input=bool(uc_dict["additional_public_input"]),
             #home_street=uc_dict["run_home"]
+            existing_points_column=existing_points_column,
+            existing_capacity_column=existing_capacity_column,
         )
 
         charging_locations_public["mode"] = "street"
@@ -355,21 +367,34 @@ def public(
     utility.save(charging_locations, uc_id, "charging-locations", uc_dict)
     utility.save(located_charging_events_gdf, uc_id, "charging-events", uc_dict)
 
-    print(uc_id, "Anzahl der Ladepunkte: ", charging_locations["charging_points"].sum())
-    print("distribution of public-charging-points successful")
     return (int(charging_locations["charging_points"].sum()), int(charging_events["energy"].sum()),
             int((charging_locations["average_charging_capacity"]*charging_locations["charging_points"]).sum()))
 
-def home(home_data: gpd.GeoDataFrame, uc_dict, mode):
+def home(home_data: gpd.GeoDataFrame, uc_dict, mode, simulation_steps=2000, vehicle_column=None,
+         existing_points_column=None, existing_capacity_column=None, label=None,
+         # Genuine reuse of an already-opened NEW (not pre-existing) location
+         # is rare for home charging - a household doesn't share another
+         # household's wallbox, so Phase 2 in distribute_charging_events_
+         # per_vehicle almost never finds a fit here regardless of how many
+         # candidates it checks. opened_list grows toward the vehicle count
+         # itself for a big city's home charging (most vehicles open their
+         # own dedicated point) - once it exceeds max_reuse_candidates, EVERY
+         # vehicle pays the full capped-search cost for a match that almost
+         # never comes. Confirmed on Berlin's 2037 home_apartment (226,072
+         # vehicles): throughput roughly halved once opened_list grew past
+         # a 20,000 cap that's better suited to work's genuinely higher
+         # reuse rate below. A small cap here barely changes which vehicles
+         # find a real match (there's so little to find) while bounding
+         # this cost.
+         max_reuse_candidates=200):
     # todo: add probability for charging infrastructure at home. Select homes that are not possible to be electrified
     # uc_id = "home"
-    # print("Use case: " + uc_id)
+    # utility.safe_print("Use case: " + uc_id)
 
     in_region = home_data
 
     if mode == "apartment":
         uc_id = "home_apartment"
-        print("Use case: " + uc_id)
         charging_events = (
             uc_dict["charging_event"]
             .loc[
@@ -378,39 +403,56 @@ def home(home_data: gpd.GeoDataFrame, uc_dict, mode):
             .reset_index()
         )
         # charging_events = charging_events.iloc[:500]
-        (
-            charging_locations_home,
-            located_charging_events,
-        ) = uc_helpers.distribute_charging_events(
-            in_region,
-            charging_events,
-            weight_column="households_total",
-            simulation_steps=2000, fill_existing_first=True,
-            rng=uc_dict["random_seed"]
-        )
+        if vehicle_column:
+            charging_locations_home, located_charging_events = uc_helpers.distribute_charging_events_per_vehicle(
+                in_region, charging_events, weight_column="households_total",
+                simulation_steps=simulation_steps, vehicle_column=vehicle_column, rng=uc_dict["random_seed"],
+                existing_points_column=existing_points_column, existing_capacity_column=existing_capacity_column,
+                label=f"{label} {uc_id}" if label else uc_id, max_reuse_candidates=max_reuse_candidates,
+            )
+        else:
+            (
+                charging_locations_home,
+                located_charging_events,
+            ) = uc_helpers.distribute_charging_events(
+                in_region,
+                charging_events,
+                weight_column="households_total",
+                simulation_steps=simulation_steps, fill_existing_first=True,
+                rng=uc_dict["random_seed"],
+                existing_points_column=existing_points_column, existing_capacity_column=existing_capacity_column,
+            )
 
     elif mode == "detached":
         uc_id = "home_detached"
-        print("Use case: " + uc_id)
         charging_events = (
             uc_dict["charging_event"]
             .loc[uc_dict["charging_event"]["charging_use_case"].isin(["home_detached"])]
             .reset_index()
         )
         # charging_events = charging_events.iloc[:500]
-        (
-            charging_locations_home,
-            located_charging_events,
-        ) = uc_helpers.distribute_charging_events(
-            in_region,
-            charging_events,
-            weight_column="households_total",
-            simulation_steps=2000, fill_existing_first=False,
-            rng=uc_dict["random_seed"]
-        )
+        if vehicle_column:
+            charging_locations_home, located_charging_events = uc_helpers.distribute_charging_events_per_vehicle(
+                in_region, charging_events, weight_column="households_total",
+                simulation_steps=simulation_steps, vehicle_column=vehicle_column, rng=uc_dict["random_seed"],
+                existing_points_column=existing_points_column, existing_capacity_column=existing_capacity_column,
+                label=f"{label} {uc_id}" if label else uc_id, max_reuse_candidates=max_reuse_candidates,
+            )
+        else:
+            (
+                charging_locations_home,
+                located_charging_events,
+            ) = uc_helpers.distribute_charging_events(
+                in_region,
+                charging_events,
+                weight_column="households_total",
+                simulation_steps=simulation_steps, fill_existing_first=True,
+                rng=uc_dict["random_seed"],
+                existing_points_column=existing_points_column, existing_capacity_column=existing_capacity_column,
+            )
 
     else:
-        print("wrong mode")
+        pass
 
     # Merge Chargin_events and Locations
     charging_locations_home["index"] = charging_locations_home.index
@@ -438,15 +480,18 @@ def home(home_data: gpd.GeoDataFrame, uc_dict, mode):
     utility.save(charging_locations, uc_id, "charging-locations", uc_dict)
     utility.save(located_charging_events_gdf, uc_id, "charging-events", uc_dict)
 
-    print(uc_id, "Anzahl der Ladepunkte: ", charging_locations["charging_points"].sum())
-    print("distribution of home-charging-points successful")
     return (int(charging_locations["charging_points"].sum()), int(charging_events["energy"].sum()),
             int((charging_locations["average_charging_capacity"]*charging_locations["charging_points"]).sum()))
 
-def work(work_data, uc_dict, office_data=None, timestep=15):
-    print("distributing uc work...")
+def work(work_data, uc_dict, office_data=None, timestep=15, weight_column="area", simulation_steps=2000, vehicle_column=None,
+         existing_points_column=None, existing_capacity_column=None, label=None,
+         # Unlike home (see home()'s own comment), work charging plausibly
+         # has genuine reuse - several employees at the same workplace can
+         # share one office charging point across different days/shifts -
+         # so a larger search is more likely to actually pay off here, not
+         # just cost more for nothing.
+         max_reuse_candidates=1_000):
     uc_id = "work"
-    print("Use case: " + uc_id)
 
     charging_events = (
         uc_dict["charging_event"]
@@ -481,7 +526,7 @@ def work(work_data, uc_dict, office_data=None, timestep=15):
             located_charging_events_office,
             availability_mask_office
         ) = uc_helpers.distribute_charging_events(
-            in_region_office, charging_events_office, weight_column="area", simulation_steps=2000,
+            in_region_office, charging_events_office, weight_column=weight_column, simulation_steps=simulation_steps,
             rng=uc_dict["random_seed"], return_mask=True, location_id_start= len(in_region_not_office)
         )
         charging_locations_work_office["office"] = True
@@ -491,7 +536,7 @@ def work(work_data, uc_dict, office_data=None, timestep=15):
             located_charging_events_not_office,
             availability_mask_not_office
         ) = uc_helpers.distribute_charging_events(
-            in_region_not_office, charging_events_not_office, weight_column="area", simulation_steps=2000,
+            in_region_not_office, charging_events_not_office, weight_column=weight_column, simulation_steps=simulation_steps,
             rng=uc_dict["random_seed"], return_mask=True
         )
         charging_locations_work_not_office["office"] = False
@@ -506,7 +551,7 @@ def work(work_data, uc_dict, office_data=None, timestep=15):
 
         # Verteilung der Street-Ladeevents auf Retail-Standorte (Multi-Use)
         charging_locations_work_after_multi_use, located_public_events = uc_helpers.distribute_charging_events(
-            charging_locations_work_office, charging_events_public, weight_column="area", simulation_steps=2000,
+            charging_locations_work_office, charging_events_public, weight_column=weight_column, simulation_steps=simulation_steps,
             rng=uc_dict["random_seed"], fill_existing_only=True, availability_mask=availability_mask_office,
             flexibility_multi_use=uc_dict["flexibility_multi_use"], location_id_start= len(in_region_not_office)
         ) # charging_events_depot austauschen gegen depot_night_events
@@ -533,14 +578,23 @@ def work(work_data, uc_dict, office_data=None, timestep=15):
     else:
         in_region = work_data
 
-        (
-            charging_locations_work,
-            located_charging_events,
-            availability_mask
-        ) = uc_helpers.distribute_charging_events(
-            in_region, charging_events, weight_column="area", simulation_steps=2000,
-            rng=uc_dict["random_seed"], return_mask=True
-        )
+        if vehicle_column:
+            charging_locations_work, located_charging_events, availability_mask = uc_helpers.distribute_charging_events_per_vehicle(
+                in_region, charging_events, weight_column=weight_column, simulation_steps=simulation_steps,
+                vehicle_column=vehicle_column, rng=uc_dict["random_seed"], return_mask=True,
+                existing_points_column=existing_points_column, existing_capacity_column=existing_capacity_column,
+                label=f"{label} {uc_id}" if label else uc_id, max_reuse_candidates=max_reuse_candidates,
+            )
+        else:
+            (
+                charging_locations_work,
+                located_charging_events,
+                availability_mask
+            ) = uc_helpers.distribute_charging_events(
+                in_region, charging_events, weight_column=weight_column, simulation_steps=simulation_steps,
+                rng=uc_dict["random_seed"], return_mask=True,
+                existing_points_column=existing_points_column, existing_capacity_column=existing_capacity_column,
+            )
 
 
     # Merge Chargin_events and Locations
@@ -578,8 +632,6 @@ def work(work_data, uc_dict, office_data=None, timestep=15):
     utility.save(charging_locations, uc_id, "charging-locations", uc_dict)
     utility.save(located_charging_events_gdf, uc_id, "charging-events", uc_dict)
 
-    print(uc_id, "Anzahl der Ladepunkte: ", charging_locations["charging_points"].sum())
-    print("distribution of work-charging-points successful")
 
     if uc_dict["multi_use_concept"] and uc_dict["use_case_multi_use"] == "work":
         charging_locations_office = charging_locations.loc[charging_locations["office"] == True]
@@ -603,7 +655,8 @@ def work(work_data, uc_dict, office_data=None, timestep=15):
         return (int(charging_locations["charging_points"].sum()), int(charging_events["energy"].sum()),
             int((charging_locations["average_charging_capacity"]*charging_locations["charging_points"]).sum()))
 
-def retail(retail_data: gpd.GeoDataFrame, uc_dict):
+def retail(retail_data: gpd.GeoDataFrame, uc_dict, simulation_steps=2000,
+           existing_points_column=None, existing_capacity_column=None):
     """
     Calculate placements and energy distribution for use case hpc.
 
@@ -614,7 +667,6 @@ def retail(retail_data: gpd.GeoDataFrame, uc_dict):
 
     """
     uc_id = "retail"
-    print("Use case: " + uc_id)
 
     charging_events_retail_slow = uc_dict["charging_event"].loc[
         uc_dict["charging_event"]["charging_use_case"].isin(["retail"])
@@ -658,9 +710,30 @@ def retail(retail_data: gpd.GeoDataFrame, uc_dict):
                                     })
         retail_data["id"] = retail_data["id_0"]
 
+    # carry existing-infrastructure and candidate-identity columns through
+    # the column-selection below if present (see existing_infrastructure.py
+    # / data_de_candidates.py); they aren't part of the fixed ALKIS/OSM
+    # candidate schema `cols` selects.
+    for extra_col in (existing_points_column, existing_capacity_column, "candidate_uid"):
+        if extra_col and extra_col in retail_data.columns and extra_col not in cols:
+            cols.append(extra_col)
+
     in_region = retail_data[cols]
-    in_region = in_region.loc[in_region["area"] > 100]
+    # Keep an existing charging site regardless of its (possibly nominal)
+    # area value - the area>100 filter is meant to weed out unrealistic new
+    # candidate sites, not to drop real, already-built infrastructure.
+    area_filter = in_region["area"] > 100
+    if existing_points_column and existing_points_column in in_region.columns:
+        area_filter |= in_region[existing_points_column].fillna(0) > 0
+    in_region = in_region.loc[area_filter]
     in_region = in_region.sort_values("id_0").reset_index(drop=True)
+
+    if in_region.empty or charging_events.empty:
+        if uc_dict["multi_use_concept"] and uc_dict["use_case_multi_use"] == "retail":
+            return 0, 0, 0, pd.DataFrame()
+        else:
+            return 0, 0, 0
+
     # Eigener RNG mit festem Seed: Retail-Standorte sind szenariounabhängig deterministisch
     rng_retail = np.random.default_rng(uc_dict["seed"])
     (
@@ -668,12 +741,12 @@ def retail(retail_data: gpd.GeoDataFrame, uc_dict):
         located_charging_events,
         availability_mask,
     ) = uc_helpers.distribute_charging_events(
-        in_region, charging_events, weight_column="area", simulation_steps=2000,
-        rng=rng_retail, return_mask=True
+        in_region, charging_events, weight_column="area", simulation_steps=simulation_steps,
+        rng=rng_retail, return_mask=True, existing_points_column=existing_points_column,
+        existing_capacity_column=existing_capacity_column
     )
 
     if uc_dict["multi_use_concept"] and uc_dict["use_case_multi_use"] == "retail":
-        print("multi-use-concept activated")
 
         # Depot Ladeevents in den Nachtstunden (Mo-Sa zwischen 21:00 und 8:00 Uhr)
         charging_events_street = uc_dict["charging_event"].loc[
@@ -683,7 +756,7 @@ def retail(retail_data: gpd.GeoDataFrame, uc_dict):
 
         # Verteilung der Street-Ladeevents auf Retail-Standorte
         charging_locations_retail_after_multi_use, located_public_events = uc_helpers.distribute_charging_events(
-            charging_locations_retail, charging_events_public, weight_column="area", simulation_steps=2000,
+            charging_locations_retail, charging_events_public, weight_column="area", simulation_steps=simulation_steps,
             rng=uc_dict["random_seed"], fill_existing_only=True, availability_mask=availability_mask,
             flexibility_multi_use=uc_dict["flexibility_multi_use"]
         ) # charging_events_depot austauschen gegen depot_night_events
@@ -732,8 +805,6 @@ def retail(retail_data: gpd.GeoDataFrame, uc_dict):
 
     # utility.plot_occupation_of_charging_points(located_charging_events, uc_id)
 
-    print(uc_id, "Anzahl der Ladepunkte: ", charging_locations["charging_points"].sum())
-    print("distribution of work-charging-points successful")
 
     if uc_dict["multi_use_concept"] and uc_dict["use_case_multi_use"] == "retail":
         return (int(charging_locations["charging_points"].sum()), int(located_charging_events["energy"].sum()),
@@ -743,9 +814,9 @@ def retail(retail_data: gpd.GeoDataFrame, uc_dict):
         return (int(charging_locations["charging_points"].sum()), int(located_charging_events["energy"].sum()),
                 int((charging_locations["average_charging_capacity"]*charging_locations["charging_points"]).sum()))
 
-def depot(depot_data: gpd.GeoDataFrame, uc_dict):
+def depot(depot_data: gpd.GeoDataFrame, uc_dict, simulation_steps=2000,
+          existing_points_column=None, existing_capacity_column=None):
     uc_id = "depot"
-    print("Use case: " + uc_id)
     charging_events_depot = uc_dict["charging_event"].loc[
         uc_dict["charging_event"]["charging_use_case"].isin(["depot"])
     ]
@@ -762,8 +833,9 @@ def depot(depot_data: gpd.GeoDataFrame, uc_dict):
         charging_locations_depot,
         located_charging_events,
     ) = uc_helpers.distribute_charging_events(
-        in_region, charging_events, weight_column="area", simulation_steps=2000,
-        rng=uc_dict["random_seed"]
+        in_region, charging_events, weight_column="area", simulation_steps=simulation_steps,
+        rng=uc_dict["random_seed"],
+        existing_points_column=existing_points_column, existing_capacity_column=existing_capacity_column,
     )
 
     # Merge Chargin_events and Locations
@@ -791,7 +863,5 @@ def depot(depot_data: gpd.GeoDataFrame, uc_dict):
     utility.save(charging_locations, uc_id, "charging-locations", uc_dict)
     utility.save(located_charging_events_gdf, uc_id, "charging-events", uc_dict)
 
-    print(uc_id, "Anzahl der Ladepunkte: ", charging_locations["charging_points"].sum())
-    print("distribution of depot-charging-points successful")
     return (int(charging_locations["charging_points"].sum()), int(located_charging_events["energy"].sum()),
             int((charging_locations["average_charging_capacity"]*charging_locations["charging_points"]).sum()))
