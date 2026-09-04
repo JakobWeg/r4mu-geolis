@@ -1,9 +1,53 @@
+import os
+import tempfile
+
 import plots as plots
 import utility as utility
 import pandas as pd
 import geopandas as gpd
 import numpy as np
 import math
+
+# Set once per worker process by run_de.py's _init_worker - the (n_locations
+# x simulation_steps) occupancy matrix is the dominant memory cost for large
+# candidate pools, and nationwide runs at DE-wide demand scale were hitting
+# Windows' COMMIT CHARGE ceiling (RAM + pagefile) even with plenty of actual
+# free physical RAM, because that memory was allocated as regular (pagefile-
+# backed) arrays. None (the default, used by the old single-region Berlin/
+# Stralsund/office configs and standalone/test usage) keeps the old
+# in-memory behaviour unchanged.
+_AVAILABILITY_SCRATCH_DIR = None
+
+
+def set_availability_scratch_dir(path):
+    global _AVAILABILITY_SCRATCH_DIR
+    _AVAILABILITY_SCRATCH_DIR = path
+    if path is not None:
+        os.makedirs(path, exist_ok=True)
+
+
+def _new_availability_array(n_locations, simulation_steps, dtype):
+    """Allocates the availability matrix as a memmap backed by a scratch
+    file when a scratch dir is configured, instead of a plain in-memory
+    array. Windows page-caches a memmap's hot pages in real RAM exactly like
+    anonymous memory as long as physical RAM is plentiful (true here - RAM
+    was never the scarce resource, only the commit-charge accounting was) -
+    so this sidesteps the actual ceiling being hit without materially
+    changing performance. The caller does not need to track or clean up the
+    backing file itself - run_de.py's process_gemeinde wrapper clears the
+    whole scratch dir after each Gemeinde finishes (confirmed: no caller
+    anywhere keeps an availability array alive past its own Gemeinde's
+    processing, including work()'s return_mask=True path, whose
+    availability_mask is captured but never used again once unpacked).
+    """
+    if _AVAILABILITY_SCRATCH_DIR is None:
+        return np.zeros((n_locations, simulation_steps), dtype=dtype)
+    fd, path = tempfile.mkstemp(suffix=".dat", dir=_AVAILABILITY_SCRATCH_DIR)
+    os.close(fd)
+    arr = np.memmap(path, dtype=dtype, mode="w+", shape=(n_locations, simulation_steps))
+    arr[:] = 0
+    return arr
+
 
 def postprocess_public_demands(charging_locations: gpd.GeoDataFrame, located_charging_events: gpd.GeoDataFrame):
 
@@ -354,7 +398,7 @@ def distribute_charging_events(
     # Gemeinden) on Kiel/Luebeck's home_apartment/home_detached candidates.
     # uint8 halves this vs. the previous int16 (an 8x reduction vs. the
     # platform default int64).
-    availability = np.zeros((n_locations, simulation_steps), dtype=np.uint8)
+    availability = _new_availability_array(n_locations, simulation_steps, np.uint8)
 
     # Plain numpy arrays instead of DataFrame .at[]/.values lookups inside the
     # hot loop, and the "reuse if free" search below is restricted to
@@ -607,7 +651,7 @@ def distribute_charging_events_per_vehicle(
         average_charging_capacity = locations[existing_capacity_column].fillna(0).to_numpy().astype(np.float64)
     else:
         average_charging_capacity = np.zeros(n_locations, dtype=np.float64)
-    availability = np.zeros((n_locations, simulation_steps), dtype=np.int16)
+    availability = _new_availability_array(n_locations, simulation_steps, np.int16)
     assigned_locations = np.full(n_events, np.nan)
 
     # Existing locations get first priority, weighted by their real installed
