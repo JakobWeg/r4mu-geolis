@@ -432,11 +432,18 @@ def home(home_data: gpd.GeoDataFrame, uc_dict, mode, simulation_steps=2000, vehi
         )
         # charging_events = charging_events.iloc[:500]
         if vehicle_column:
-            charging_locations_home, located_charging_events = uc_helpers.distribute_charging_events_per_vehicle(
+            # Household-capped, not the time-window search used for
+            # home_apartment - see distribute_charging_events_household_
+            # capped's own docstring for why that's the right tradeoff for
+            # detached houses specifically (at most 1-2 real households per
+            # address, each with its own dedicated point - no genuine
+            # shared-infrastructure timing question the way an apartment
+            # building has).
+            charging_locations_home, located_charging_events = uc_helpers.distribute_charging_events_household_capped(
                 in_region, charging_events, weight_column="households_total",
-                simulation_steps=simulation_steps, vehicle_column=vehicle_column, rng=uc_dict["random_seed"],
+                vehicle_column=vehicle_column, household_column="households_total", rng=uc_dict["random_seed"],
                 existing_points_column=existing_points_column, existing_capacity_column=existing_capacity_column,
-                label=f"{label} {uc_id}" if label else uc_id, max_reuse_candidates=max_reuse_candidates,
+                label=f"{label} {uc_id}" if label else uc_id,
             )
         else:
             (

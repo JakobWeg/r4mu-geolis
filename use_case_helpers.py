@@ -109,6 +109,25 @@ def postprocess_public_demands(charging_locations: gpd.GeoDataFrame, located_cha
     umverteilte_events = 0
     zugeschlagene_punkte = 0
 
+    # Umverteilungen werden nur GESAMMELT (reassigned_idx/reassigned_loc_id/
+    # reassigned_geom), nicht einzeln in die Schleife hinein geschrieben - ein
+    # einzelnes located_charging_events.at[idx, spalte] = wert pro Treffer
+    # kostet bei Arrow-gestützten Spalten (pandas' neuer Default für "mode"
+    # als string- und "geometry" als object-Spalte) jeweils den Neuaufbau der
+    # KOMPLETTEN Spalte, nicht nur der einen Zelle - bei Hunderttausenden
+    # Treffern quadratisch statt linear. Bestätigt per py-spy: Hamburgs 2037er
+    # public() hing hier über eine Stunde fest (__setitem__ auf einer
+    # Arrow-ChunkedArray, siehe pandas/core/arrays/arrow/array.py). Die drei
+    # Spalten werden nach der Schleife in je einem einzigen vektorisierten
+    # .loc[]-Write gesetzt - exakt gleiches Ergebnis, da occupancy_mask (die
+    # einzige innerhalb der Schleife GELESENE geteilte Struktur) weiterhin
+    # sofort aktualisiert wird und located_charging_events selbst innerhalb
+    # der Schleife nie gelesen wird (home_events ist ein Snapshot von VOR der
+    # Schleife).
+    reassigned_idx = []
+    reassigned_loc_id = []
+    reassigned_geom = []
+
     # Nur home_street-Events durchgehen (statt aller Events mit anschließendem
     # Skip).
     for row in home_events.itertuples():
@@ -151,11 +170,11 @@ def postprocess_public_demands(charging_locations: gpd.GeoDataFrame, located_cha
         if winner_idx is not None:
             new_location_id = street_ids_arr[winner_idx]
 
-            # Ladevent umverteilen
-            idx = row.Index
-            located_charging_events.at[idx, "location_id"] = new_location_id
-            located_charging_events.at[idx, "mode"] = "street"
-            located_charging_events.at[idx, "geometry"] = street_geoms[winner_idx]
+            # Ladevent umverteilen - Werte nur sammeln, siehe Kommentar oben;
+            # tatsächlich geschrieben wird erst nach der Schleife.
+            reassigned_idx.append(row.Index)
+            reassigned_loc_id.append(new_location_id)
+            reassigned_geom.append(street_geoms[winner_idx])
 
             # Maske updaten
             # Abziehen der belegten Zeitschritte von der ursprünglichen home_street Location
@@ -165,6 +184,11 @@ def postprocess_public_demands(charging_locations: gpd.GeoDataFrame, located_cha
             occupancy_mask[new_location_id][start:end] += 1
 
             umverteilte_events += 1
+
+    if reassigned_idx:
+        located_charging_events.loc[reassigned_idx, "location_id"] = reassigned_loc_id
+        located_charging_events.loc[reassigned_idx, "mode"] = "street"
+        located_charging_events.loc[reassigned_idx, "geometry"] = reassigned_geom
 
 
     # Berechnung der maximalen gleichzeitigen Belegung je Location - vektorisiert
@@ -305,6 +329,7 @@ def distribute_charging_events(
     location_id_start: int = 0,
     existing_points_column: str = None,
     existing_capacity_column: str = None,
+    max_reuse_search: int = 5_000,
 ):
     """
     Distributes charging events to locations with optional random assignment.
@@ -319,14 +344,25 @@ def distribute_charging_events(
     existing infrastructure get filled before any new location is proposed -
     no separate "existing first" pass needed.
 
-    The reuse search below checks every currently-opened location (no cap):
-    since run_de.py simulates one Gemeinde at a time, "opened" here means
-    opened within one Gemeinde's one use case, not nationwide - a few
-    thousand at most even for the largest city, not the ~270k a use case can
-    reach nationwide. That search is one vectorized numpy call over however
-    many are open, not a Python-level loop per candidate, so it stays fast
-    at that scale (unlike distribute_charging_events_per_vehicle, which
-    checks multiple time windows per vehicle and genuinely needs its cap).
+    max_reuse_search caps how many currently-opened locations the reuse
+    search below checks per event (same idea as
+    distribute_charging_events_per_vehicle's max_reuse_candidates). This used
+    to be unbounded on the assumption that "opened" - within one Gemeinde's
+    one use case, not nationwide - stays a few thousand at most even for the
+    largest city, so a single vectorized numpy call over all of them would
+    stay fast. True for 2024 (opened_list starts empty, only grows from
+    genuinely-new-in-that-Gemeinde placements) but not from 2037 onward:
+    opened_list is now SEEDED with the previous scenario year's real
+    infrastructure (existing_points_column) and keeps growing over a whole
+    year of events, and `availability` is memmap-backed (see
+    _new_availability_array) - confirmed via py-spy that Berlin's 2037
+    public() was stuck for over an hour on exactly this line, doing a fresh
+    np.array(opened_list) fancy-index gather out of the memmap array on
+    every single event. Random subsample, not a fixed truncation, for the
+    same reason Phase 1's max_existing_search uses one (see
+    distribute_charging_events_per_vehicle) - every opened location keeps a
+    fair chance of being found free by SOME event over the run instead of
+    permanently favoring whichever happen to sort first.
     """
     # reset seed so that the locations are always the same
     #rng = np.random.default_rng(seed)
@@ -487,7 +523,10 @@ def distribute_charging_events(
                 pass
 
             if opened_list:
-                search_idx = np.array(opened_list)
+                if len(opened_list) > max_reuse_search:
+                    search_idx = rng.choice(opened_list, size=max_reuse_search, replace=False)
+                else:
+                    search_idx = np.array(opened_list)
                 in_use = availability[search_idx, start:end].max(axis=1)
                 required = charging_points[search_idx]
                 free_mask = in_use < required
@@ -526,6 +565,20 @@ def distribute_charging_events(
             if was_unopened:
                 opened_list.append(assigned)
 
+        # Reusing an existing point (Phase 1/2 above) never touches
+        # average_charging_capacity - only the "open a brand-new point"
+        # branch above updates it. A real existing-infrastructure site (e.g.
+        # BNetzA) can be seeded with a low rated capacity (a small
+        # "Normalladeeinrichtung" can average under 1 kW per point) yet still
+        # get picked, via slot availability alone, for an event needing far
+        # more power (confirmed: 22-50 kW SimBEV events reused BNetzA points
+        # rated ~0.5-0.925 kW). Bump the recorded capacity up to whatever was
+        # actually drawn here instead of leaving a stale, too-low value -
+        # never bump it down, since other events at this same location may
+        # still need its full existing rating.
+        if capacity > average_charging_capacity[assigned]:
+            average_charging_capacity[assigned] = capacity
+
         availability[assigned, start:end] += 1
         pos = existing_pos.get(int(assigned))
         if pos is not None:
@@ -561,6 +614,7 @@ def distribute_charging_events_per_vehicle(
     return_mask: bool = False,
     location_id_start: int = 0,
     max_reuse_candidates: int = 20_000,
+    max_existing_search: int = 10_000,
     existing_points_column: str = None,
     existing_capacity_column: str = None,
     label: str = None,
@@ -693,6 +747,27 @@ def distribute_charging_events_per_vehicle(
     # would itself become a meaningful slowdown, and swamp the console.
     progress_step = max(1, n_groups // 200)
 
+    # Phase 1's own per-vehicle cost is already bounded by max_existing_search
+    # (see below), but that only caps the WIDTH of each vehicle's search, not
+    # how many vehicles pay that cost - total Phase 1 work is O(n_groups *
+    # max_existing_search * avg_windows_per_vehicle), so a fixed width that's
+    # fine for a mid-size Gemeinde becomes intractable purely because
+    # n_groups is 10x+ larger at megacity scale. Confirmed: 10,000 width, 27k
+    # vehicles (a mid-size Gemeinde's home_detached) finished in 352s: 10,000
+    # width, ~226k vehicles (Berlin's 2037 home_apartment, where existing_idx
+    # is populated for the first time from real 2024 infrastructure) still
+    # only managed ~3-5 vehicles/sec even after vectorizing - projected
+    # 12-20+ hours for that one stage alone. Scale the width down as
+    # n_groups grows so total Phase 1 cost per Gemeinde stays roughly
+    # constant regardless of city size, instead of only bounding the
+    # per-vehicle cost and letting the city-size multiplier through
+    # unchecked. Budget calibrated against the 27k-vehicle/10,000-width run
+    # that completed in 352s (~2.7M vehicle*width "budget units"); floor of
+    # 500 keeps even the largest cities' Phase 1 matching non-trivial rather
+    # than reducing it to a coin flip.
+    PHASE1_BUDGET = 27_000 * 10_000
+    effective_max_existing_search = min(max_existing_search, max(500, PHASE1_BUDGET // max(n_groups, 1)))
+
     # Locations with charging_points > 0, in the order they were opened.
     # Tracked incrementally instead of recomputing via np.nonzero(charging_points)
     # every vehicle - that alone is an O(n_locations) scan per vehicle, i.e.
@@ -727,16 +802,28 @@ def distribute_charging_events_per_vehicle(
         # in the 2024 run) - a Python-level loop over all of them for every
         # one of a later, higher-demand year's hundreds of thousands of
         # vehicles is tens of billions of Python-level checks, confirmed to
-        # make Berlin's 2037 home_apartment placement run for hours. A first
-        # attempt fixed this by capping the search to the highest-weight
-        # candidates (mirroring Phase 2's max_reuse_candidates cap below) -
+        # make Berlin's 2037 home_apartment placement run for hours even
+        # after vectorizing (~3-5 vehicles/sec, 12-20+ hours projected/
+        # confirmed for that one stage alone - existing_idx.size itself, not
+        # just the Python-level loop, was still the dominant cost).
+        #
+        # max_existing_search bounds this the same way Phase 2's
+        # max_reuse_candidates does below, but as a RANDOM subsample of
+        # existing_idx drawn fresh per vehicle, not a fixed truncation. A
+        # first attempt used a fixed cap (the highest-weight candidates) -
         # reverted, since that made every OTHER existing location invisible
-        # to Phase 1 for the rest of the run, defeating the whole point of
-        # carrying real infrastructure forward across scenario years and
-        # pushing vehicles into needlessly opening new locations instead.
-        # Vectorizing keeps every existing location reachable while removing
-        # the O(existing_idx) Python-level factor entirely.
+        # to Phase 1 for the REST of the run, defeating the whole point of
+        # carrying real infrastructure forward across scenario years. A
+        # fresh random subsample per vehicle instead means every existing
+        # location keeps a fair (if not certain) chance of being checked by
+        # SOME vehicle over the course of the whole run - a probabilistic
+        # trade against Phase 1's own exhaustiveness, not a permanent
+        # exclusion.
         if existing_idx.size:
+            if existing_idx.size > effective_max_existing_search:
+                search_positions = rng.choice(existing_idx.size, size=effective_max_existing_search, replace=False)
+            else:
+                search_positions = np.arange(existing_idx.size)
             # Tried combining ALL of a vehicle's windows into one fancy-index
             # call here (a real home-charging vehicle has ~80 charging
             # events/year, not the 1-4 a first synthetic benchmark assumed -
@@ -746,18 +833,21 @@ def distribute_charging_events_per_vehicle(
             # one huge (n_existing x combined_steps) temporary array in one
             # shot costs more in allocation/memory-bandwidth than it saves in
             # reduced call count. Reverted - the per-window loop below stays.
-            fits_mask = np.ones(existing_idx.size, dtype=bool)
+            fits_mask = np.ones(search_positions.size, dtype=bool)
             for s, e in windows:
                 if e > s:
                     # existing_availability (a contiguous mirror of just
-                    # these rows - see above), not availability[existing_idx,
-                    # s:e] - avoids a scattered gather out of the much bigger
-                    # main array on every single vehicle.
-                    in_use = existing_availability[:, s:e].max(axis=1)
-                    fits_mask &= in_use < charging_points[existing_idx]
+                    # these rows - see above), indexed by this vehicle's own
+                    # random search_positions subsample, not the full
+                    # existing_idx range - avoids a scattered gather out of
+                    # the much bigger main array AND bounds the per-vehicle
+                    # cost regardless of how large existing_idx itself is.
+                    in_use = existing_availability[search_positions, s:e].max(axis=1)
+                    fits_mask &= in_use < charging_points[existing_idx[search_positions]]
             if fits_mask.any():
-                fit_idx = existing_idx[fits_mask]
-                fit_weights = existing_weight[fits_mask]
+                fit_positions = search_positions[fits_mask]
+                fit_idx = existing_idx[fit_positions]
+                fit_weights = existing_weight[fit_positions]
                 weight_sum = fit_weights.sum()
                 assigned = (rng.choice(fit_idx, p=fit_weights / weight_sum)
                             if weight_sum > 0 else rng.choice(fit_idx))
@@ -814,6 +904,19 @@ def distribute_charging_events_per_vehicle(
             if was_unopened and charging_points[assigned] > 0:
                 opened_list.append(assigned)
 
+        # Same fix as distribute_charging_events(): Phase 1/2 above reuse an
+        # existing point without ever updating average_charging_capacity, so
+        # a real (e.g. BNetzA) site seeded with a low rated capacity keeps
+        # that value forever even after a vehicle needing far more power
+        # gets matched to it purely on slot availability. Use this vehicle's
+        # OWN highest-demand event, not the .mean() the Phase-3 branch above
+        # uses for its running average - a vehicle with a mix of low- and
+        # high-power sessions still needs the location to cover its peak.
+        # Never lowers the recorded capacity, only raises it.
+        needed_capacity = capacity_arr[rows].max()
+        if needed_capacity > average_charging_capacity[assigned]:
+            average_charging_capacity[assigned] = needed_capacity
+
         pos = existing_pos.get(int(assigned))
         for s, e in windows:
             if e > s:
@@ -847,6 +950,119 @@ def distribute_charging_events_per_vehicle(
     if return_mask:
         return locations, events, availability
     return locations, events
+
+def distribute_charging_events_household_capped(
+    locations: gpd.GeoDataFrame,
+    events: pd.DataFrame,
+    weight_column: str,
+    vehicle_column: str,
+    household_column: str,
+    rng: np.random.Generator = None,
+    location_id_start: int = 0,
+    existing_points_column: str = None,
+    existing_capacity_column: str = None,
+    label: str = None,
+):
+    """
+    Simplified home_detached placement - no time-window/availability
+    checking at all, unlike distribute_charging_events_per_vehicle.
+
+    Why this is safe to skip here (but not for home_apartment): a real
+    detached-house address has at most 1-2 households (confirmed against
+    infas_home_detached_de.gpkg's own household_column - individual geocoded
+    addresses, not aggregated areas), and each EV there gets its own
+    dedicated wallbox - there's no genuine time-sharing question the way a
+    multi-household apartment building's shared infrastructure has. So
+    instead of the expensive per-vehicle, per-window Phase 1 (existing
+    infrastructure) / Phase 2 (reuse search) scan that dominates
+    home_apartment's cost (confirmed: Berlin's 2037 home_apartment took
+    ~24h for that reason alone), each vehicle just draws a candidate
+    weighted by weight_column, restricted to candidates that haven't yet
+    reached their OWN real household count - so a single address never
+    silently accumulates more charging points than it has households (the
+    modeling gap this replaces: household_column previously only weighted
+    the draw probability, with no cap on how many vehicles could land on
+    one address). Only once EVERY candidate is already at its own cap does
+    a vehicle's draw fall back to the uncapped weighted distribution -
+    better to slightly over-assign one address than leave a vehicle
+    unplaced (mirrors distribute_charging_events_per_vehicle's own
+    existing-infra-then-fallback pattern, just without the time dimension).
+    """
+    n_locations = len(locations)
+    n_events = len(events)
+
+    if n_locations == 0:
+        locations = locations.reset_index().copy()
+        locations["charging_points"] = pd.array([], dtype="int64")
+        locations["average_charging_capacity"] = pd.array([], dtype="int64")
+        locations.index = locations.index + location_id_start
+        events = events.copy()
+        events["assigned_location"] = np.full(n_events, np.nan)
+        return locations, events
+
+    weights = locations[weight_column].fillna(0).to_numpy().astype(np.float64)
+    # Never below 1: a candidate with an unknown/zero household count should
+    # still be able to host at least one vehicle rather than being
+    # permanently excluded from the capped pool below.
+    household_cap = np.maximum(locations[household_column].fillna(1).to_numpy().astype(np.int64), 1)
+    locations = locations.reset_index().copy()
+
+    if existing_points_column and existing_points_column in locations.columns:
+        charging_points = locations[existing_points_column].fillna(0).to_numpy().astype(np.int64)
+    else:
+        charging_points = np.zeros(n_locations, dtype=np.int64)
+    if existing_capacity_column and existing_capacity_column in locations.columns:
+        average_charging_capacity = locations[existing_capacity_column].fillna(0).to_numpy().astype(np.float64)
+    else:
+        average_charging_capacity = np.zeros(n_locations, dtype=np.float64)
+
+    capacity_arr = events["station_charging_capacity"].to_numpy()
+    vehicle_groups = events.groupby(vehicle_column, sort=False).indices
+    n_groups = len(vehicle_groups)
+    progress_step = max(1, n_groups // 200)
+
+    assigned_locations = np.full(n_events, np.nan)
+    has_room = charging_points < household_cap
+
+    for g_idx, rows in enumerate(vehicle_groups.values()):
+        if has_room.any():
+            pool_weights = weights * has_room
+            weight_sum = pool_weights.sum()
+            probabilities = (pool_weights / weight_sum if weight_sum > 0
+                              else has_room.astype(np.float64) / has_room.sum())
+        else:
+            # Every candidate is already at its own household cap - ignore
+            # the cap for this vehicle rather than leaving it unplaced.
+            weight_sum = weights.sum()
+            probabilities = weights / weight_sum if weight_sum > 0 else np.full(n_locations, 1.0 / n_locations)
+
+        assigned = rng.choice(n_locations, p=probabilities)
+        prev_count = charging_points[assigned]
+        prev_avg = average_charging_capacity[assigned]
+        average_charging_capacity[assigned] = (prev_avg * prev_count + capacity_arr[rows].mean()) / (prev_count + 1)
+        charging_points[assigned] += 1
+        if charging_points[assigned] >= household_cap[assigned]:
+            has_room[assigned] = False
+        assigned_locations[rows] = assigned
+
+        if g_idx % progress_step == 0 or g_idx == n_groups - 1:
+            percent = (g_idx + 1) / n_groups * 100
+            utility.safe_print(
+                f"\r--- {label or 'distribute_charging_events_household_capped'}: "
+                f"{g_idx + 1}/{n_groups} vehicles ({percent:.1f}%) ---",
+                end="", flush=True)
+    if n_groups:
+        utility.safe_print("")
+
+    locations["charging_points"] = charging_points
+    locations["average_charging_capacity"] = average_charging_capacity.astype(int)
+
+    events = events.copy()
+    events["assigned_location"] = assigned_locations + location_id_start
+    locations.index = locations.index + location_id_start
+
+    return locations, events
+
 
 def distribute_charging_events_fill_existing_only(
     locations: gpd.GeoDataFrame,
