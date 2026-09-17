@@ -835,7 +835,26 @@ def depot(depot_data: gpd.GeoDataFrame, uc_dict, simulation_steps=2000,
     if "area" not in in_region.columns:
         in_region  = in_region.rename(columns={"Area[m2]": "area"})
 
-    in_region = in_region.loc[in_region["area"] > 1]
+    # Real, already-installed depot infrastructure (carried forward from an
+    # earlier scenario year via location_registry, or matched BNetzA
+    # capacity) can be appended as an "orphaned" candidate row with every
+    # other column - including area - left NaN (see location_registry.py's
+    # merge_previous_scenario_into_candidates/existing_infrastructure.py's
+    # merge_existing_into_candidates, both of which only ever populate
+    # candidate_uid/existing_points/existing_capacity_kw/geometry for such
+    # rows). A bare `area > 1` filter drops these silently (NaN > 1 is
+    # False), and since run_de.py's own "if candidates.empty" check runs
+    # BEFORE this filter, a Gemeinde whose only depot candidate is exactly
+    # one such row never triggers the synthetic-center fallback either -
+    # its entire depot demand goes unplaced with no warning (confirmed via
+    # an isolated reproduction: AGS 03256012's single real depot candidate,
+    # existing_capacity_kw=27.0 but area=NaN, exactly hit this). retail()
+    # already exempts existing infrastructure from its own area filter the
+    # same way - depot() just never had that exemption.
+    usable = in_region["area"] > 1
+    if existing_points_column and existing_points_column in in_region.columns:
+        usable |= in_region[existing_points_column].fillna(0) > 0
+    in_region = in_region.loc[usable]
     (
         charging_locations_depot,
         located_charging_events,

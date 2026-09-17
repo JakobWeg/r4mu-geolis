@@ -1007,14 +1007,28 @@ def distribute_charging_events_household_capped(
     household_cap = np.maximum(locations[household_column].fillna(1).to_numpy().astype(np.int64), 1)
     locations = locations.reset_index().copy()
 
+    # existing_points: real, already-installed wallboxes carried forward
+    # from an earlier scenario year (see run_de.py's existing_cols comment) -
+    # used ONLY to bias which address THIS year's vehicles land on (Phase 1
+    # below), never folded into charging_points/has_room directly. Doing
+    # that used to make an already-fully-assigned address permanently
+    # ineligible (has_room = charging_points < household_cap, with
+    # charging_points pre-seeded at the cap) for every vehicle THIS year
+    # regardless of demand - confirmed responsible for 40% of home_detached's
+    # real 2024 addresses getting dropped by 2037, since a full address could
+    # then only ever be reassigned via the "every candidate is full" global
+    # fallback below, not through its own genuine demand. charging_points
+    # itself now always starts at 0 and counts only THIS year's own
+    # assignments, so household_cap is enforced per scenario year (an
+    # address never gets more simultaneous wallboxes than it has
+    # households), while Phase 1 makes it likely - not just possible - that
+    # an address with a real existing wallbox gets THIS year's vehicle too.
     if existing_points_column and existing_points_column in locations.columns:
-        charging_points = locations[existing_points_column].fillna(0).to_numpy().astype(np.int64)
+        existing_points = locations[existing_points_column].fillna(0).to_numpy().astype(np.int64)
     else:
-        charging_points = np.zeros(n_locations, dtype=np.int64)
-    if existing_capacity_column and existing_capacity_column in locations.columns:
-        average_charging_capacity = locations[existing_capacity_column].fillna(0).to_numpy().astype(np.float64)
-    else:
-        average_charging_capacity = np.zeros(n_locations, dtype=np.float64)
+        existing_points = np.zeros(n_locations, dtype=np.int64)
+    average_charging_capacity = np.zeros(n_locations, dtype=np.float64)
+    charging_points = np.zeros(n_locations, dtype=np.int64)
 
     capacity_arr = events["station_charging_capacity"].to_numpy()
     vehicle_groups = events.groupby(vehicle_column, sort=False).indices
@@ -1023,24 +1037,51 @@ def distribute_charging_events_household_capped(
 
     assigned_locations = np.full(n_events, np.nan)
     has_room = charging_points < household_cap
+    # How many of an address's real existing wallboxes are still unclaimed
+    # by one of THIS year's vehicles - decremented as Phase 1 below assigns
+    # them, so a 2-wallbox address doesn't have its second slot handed to
+    # the same vehicle twice, and so it stops being preferred once genuinely
+    # full for the year.
+    existing_unclaimed = existing_points.copy()
+    existing_idx = np.nonzero(existing_points)[0]
 
     for g_idx, rows in enumerate(vehicle_groups.values()):
-        if has_room.any():
-            pool_weights = weights * has_room
-            weight_sum = pool_weights.sum()
-            probabilities = (pool_weights / weight_sum if weight_sum > 0
-                              else has_room.astype(np.float64) / has_room.sum())
-        else:
-            # Every candidate is already at its own household cap - ignore
-            # the cap for this vehicle rather than leaving it unplaced.
-            weight_sum = weights.sum()
-            probabilities = weights / weight_sum if weight_sum > 0 else np.full(n_locations, 1.0 / n_locations)
+        assigned = None
 
-        assigned = rng.choice(n_locations, p=probabilities)
+        # Phase 1: prefer an address with a real, not-yet-claimed-this-year
+        # wallbox over drawing among all candidates uniformly by weight -
+        # the whole point of carrying existing_points forward is that this
+        # address most likely still has an EV owner, not that it's merely
+        # allowed to get one again.
+        if existing_idx.size:
+            free_mask = (existing_unclaimed[existing_idx] > 0) & has_room[existing_idx]
+            if free_mask.any():
+                free_existing = existing_idx[free_mask]
+                free_weights = existing_unclaimed[free_existing].astype(np.float64)
+                weight_sum = free_weights.sum()
+                assigned = int(rng.choice(free_existing, p=free_weights / weight_sum)
+                               if weight_sum > 0 else rng.choice(free_existing))
+
+        if assigned is None:
+            if has_room.any():
+                pool_weights = weights * has_room
+                weight_sum = pool_weights.sum()
+                probabilities = (pool_weights / weight_sum if weight_sum > 0
+                                  else has_room.astype(np.float64) / has_room.sum())
+            else:
+                # Every candidate is already at its own household cap this
+                # year - ignore the cap for this vehicle rather than leaving
+                # it unplaced.
+                weight_sum = weights.sum()
+                probabilities = weights / weight_sum if weight_sum > 0 else np.full(n_locations, 1.0 / n_locations)
+            assigned = int(rng.choice(n_locations, p=probabilities))
+
         prev_count = charging_points[assigned]
         prev_avg = average_charging_capacity[assigned]
         average_charging_capacity[assigned] = (prev_avg * prev_count + capacity_arr[rows].mean()) / (prev_count + 1)
         charging_points[assigned] += 1
+        if existing_unclaimed[assigned] > 0:
+            existing_unclaimed[assigned] -= 1
         if charging_points[assigned] >= household_cap[assigned]:
             has_room[assigned] = False
         assigned_locations[rows] = assigned
