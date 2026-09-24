@@ -34,9 +34,16 @@ def hpc(hpc_data: gpd.GeoDataFrame, uc_dict, timestep=15, uc_id="hpc", weight_co
         instead); only relevant for the urban_fast case
     """
 
-    mask = uc_dict["charging_event"]["charging_use_case"].isin([charging_use_case])
+    # == single value, not .isin([single value]) - equivalent result, but
+    # .isin() against an Arrow-backed string column (pandas 3.x default)
+    # has no fast hash-table path for a single-element list, while == does a
+    # plain vectorized comparison - a real cost difference on this table
+    # (uc_dict["charging_event"], up to a megacity's full per-Gemeinde event
+    # count), same class of fix as documented at length in
+    # restructure_output.py's process_gemeinde().
+    mask = uc_dict["charging_event"]["charging_use_case"] == charging_use_case
     if exclude_shopping:
-        mask &= ~uc_dict["charging_event"]["location"].isin(["shopping"])
+        mask &= uc_dict["charging_event"]["location"] != "shopping"
     charging_events = uc_dict["charging_event"].loc[mask].reset_index()
 
     in_region = hpc_data
@@ -107,9 +114,8 @@ def public(
             charging_events_commerical = charging_locations_public_after_multi_use.reset_index(drop=True)
 
             charging_events_private = uc_dict["charging_event"].loc[
-                uc_dict["charging_event"]["charging_use_case"].isin(["street"]) & uc_dict["charging_event"][
-                    "Type"].isin(
-                    ["Private"])
+                (uc_dict["charging_event"]["charging_use_case"] == "street")
+                & (uc_dict["charging_event"]["Type"] == "Private")
                 ]
 
             charging_events = pd.concat([charging_events_private, charging_events_commerical], ignore_index=True)
@@ -286,7 +292,23 @@ def public(
             rng=uc_dict["random_seed"],
             # fill_existing_only=fill_existing_only,
             fill_existing_first=True,
-            additional_street_input=bool(uc_dict["additional_public_input"])
+            additional_street_input=bool(uc_dict["additional_public_input"]),
+            # Missing until now, unlike the not_home_street call right below -
+            # home_street's own candidates are the SAME home_apartment layer
+            # home_apartment() places onto (run_de.py: `dc.load_candidates(
+            # prepared_dir, "home_apartment", ags)`), which IS correctly
+            # seeded with the previous scenario's existing_points/capacity
+            # (LAYER_KEY_TO_USE_CASE maps "home_apartment"->"home_apartment"
+            # unchanged) - it just never got wired into THIS call, so every
+            # home_street location started at 0 real infrastructure every
+            # scenario year regardless of what the previous year actually
+            # built there. Each call (this one, and home_apartment()'s own)
+            # gets its own independent copy of the layer and its own
+            # independent event population, so seeding both from the same
+            # carried-forward column is the same safe, intended pattern used
+            # everywhere else in this file - not a double-count risk.
+            existing_points_column=existing_points_column,
+            existing_capacity_column=existing_capacity_column,
         )
         charging_locations_public_home["mode"] = "home_street"
         located_charging_events_public_home["mode"] = "home_street"
@@ -398,7 +420,7 @@ def home(home_data: gpd.GeoDataFrame, uc_dict, mode, simulation_steps=2000, vehi
         charging_events = (
             uc_dict["charging_event"]
             .loc[
-                uc_dict["charging_event"]["charging_use_case"].isin(["home_apartment"])
+                uc_dict["charging_event"]["charging_use_case"] == "home_apartment"
             ]
             .reset_index()
         )
@@ -427,7 +449,7 @@ def home(home_data: gpd.GeoDataFrame, uc_dict, mode, simulation_steps=2000, vehi
         uc_id = "home_detached"
         charging_events = (
             uc_dict["charging_event"]
-            .loc[uc_dict["charging_event"]["charging_use_case"].isin(["home_detached"])]
+            .loc[uc_dict["charging_event"]["charging_use_case"] == "home_detached"]
             .reset_index()
         )
         # charging_events = charging_events.iloc[:500]
@@ -502,7 +524,7 @@ def work(work_data, uc_dict, office_data=None, timestep=15, weight_column="area"
 
     charging_events = (
         uc_dict["charging_event"]
-        .loc[uc_dict["charging_event"]["charging_use_case"].isin(["work"])]
+        .loc[uc_dict["charging_event"]["charging_use_case"] == "work"]
         .reset_index()
     )
 
@@ -550,8 +572,19 @@ def work(work_data, uc_dict, office_data=None, timestep=15, weight_column="area"
         located_charging_events_not_office["office"] = False
 
         # Depot Ladeevents in den Nachtstunden (Mo-Sa zwischen 21:00 und 8:00 Uhr)
+        # Same class of fix as the isin() rewrites above/in restructure_output.py:
+        # "charging_use_case" == single value (no .isin([x]) fast-path issue),
+        # and "Type" checked via a Python set + np.fromiter instead of
+        # .isin(uc_dict["multi_use_group"]) - .isin() against an Arrow-backed
+        # object column has no fast hash-table path regardless of how many
+        # candidate values it's checking against.
+        multi_use_group_set = set(uc_dict["multi_use_group"])
+        type_np = uc_dict["charging_event"]["Type"].to_numpy(dtype=object)
+        in_multi_use_group = np.fromiter(
+            (t in multi_use_group_set for t in type_np), dtype=bool, count=type_np.size
+        )
         charging_events_street = uc_dict["charging_event"].loc[
-            uc_dict["charging_event"]["charging_use_case"].isin(["street"]) & uc_dict["charging_event"]["Type"].isin(uc_dict["multi_use_group"])
+            (uc_dict["charging_event"]["charging_use_case"] == "street") & in_multi_use_group
         ]
         charging_events_public = charging_events_street.reset_index()
         charging_events_public["office"] = True
@@ -676,12 +709,12 @@ def retail(retail_data: gpd.GeoDataFrame, uc_dict, simulation_steps=2000,
     uc_id = "retail"
 
     charging_events_retail_slow = uc_dict["charging_event"].loc[
-        uc_dict["charging_event"]["charging_use_case"].isin(["retail"])
+        uc_dict["charging_event"]["charging_use_case"] == "retail"
     ]
 
     charging_events_retail_hpc = uc_dict["charging_event"].loc[
-        uc_dict["charging_event"]["charging_use_case"].isin(["urban_fast"])
-        & uc_dict["charging_event"]["location"].isin(["shopping"])
+        (uc_dict["charging_event"]["charging_use_case"] == "urban_fast")
+        & (uc_dict["charging_event"]["location"] == "shopping")
     ]
 
     charging_events = pd.concat(
@@ -756,8 +789,19 @@ def retail(retail_data: gpd.GeoDataFrame, uc_dict, simulation_steps=2000,
     if uc_dict["multi_use_concept"] and uc_dict["use_case_multi_use"] == "retail":
 
         # Depot Ladeevents in den Nachtstunden (Mo-Sa zwischen 21:00 und 8:00 Uhr)
+        # Same class of fix as the isin() rewrites above/in restructure_output.py:
+        # "charging_use_case" == single value (no .isin([x]) fast-path issue),
+        # and "Type" checked via a Python set + np.fromiter instead of
+        # .isin(uc_dict["multi_use_group"]) - .isin() against an Arrow-backed
+        # object column has no fast hash-table path regardless of how many
+        # candidate values it's checking against.
+        multi_use_group_set = set(uc_dict["multi_use_group"])
+        type_np = uc_dict["charging_event"]["Type"].to_numpy(dtype=object)
+        in_multi_use_group = np.fromiter(
+            (t in multi_use_group_set for t in type_np), dtype=bool, count=type_np.size
+        )
         charging_events_street = uc_dict["charging_event"].loc[
-            uc_dict["charging_event"]["charging_use_case"].isin(["street"]) & uc_dict["charging_event"]["Type"].isin(uc_dict["multi_use_group"])
+            (uc_dict["charging_event"]["charging_use_case"] == "street") & in_multi_use_group
         ]
         charging_events_public = charging_events_street.reset_index()
 
@@ -825,7 +869,7 @@ def depot(depot_data: gpd.GeoDataFrame, uc_dict, simulation_steps=2000,
           existing_points_column=None, existing_capacity_column=None):
     uc_id = "depot"
     charging_events_depot = uc_dict["charging_event"].loc[
-        uc_dict["charging_event"]["charging_use_case"].isin(["depot"])
+        uc_dict["charging_event"]["charging_use_case"] == "depot"
     ]
 
     charging_events = charging_events_depot.reset_index()

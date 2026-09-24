@@ -308,7 +308,14 @@ def get_id(use_case_id, location_id):
     location_id = location_id.astype(int)
     uc_id = use_case_map.get(use_case_id)
 
-    ids = location_id.astype(str).apply(lambda x: int(uc_id + x))
+    # Vectorized string concat + one bulk astype(int), not a per-row
+    # .apply(lambda x: int(uc_id + x)) - get_id() runs once per EVENT for
+    # every use case call (located_charging_events_gdf["assigned_location"],
+    # potentially millions of rows for a megacity), so a Python-level
+    # function call per row was a real, avoidable cost. Same resulting
+    # values either way (still plain string concatenation under the hood),
+    # just without invoking int() from Python once per row.
+    ids = (uc_id + location_id.astype(str)).astype(int)
 
     return ids.values.astype(int)
 
@@ -489,6 +496,29 @@ def distribute_charging_events(
     # existing infrastructure) before the loop starts.
     opened_list = list(np.nonzero(charging_points)[0])
 
+    # Compact, growable RAM mirror of just opened_list's own rows of
+    # `availability` - same idea as existing_availability above, but for the
+    # (much larger, dynamically growing) set of ALL opened locations, not
+    # just the ones with real pre-existing infrastructure. This is the fix
+    # for the bottleneck max_reuse_search's docstring above describes: even
+    # capped at max_reuse_search candidates, fancy-indexing `availability`
+    # (memmap-backed) with a random row selection forces genuine scattered
+    # disk reads every single event, with no locality to exploit - py-spy
+    # confirmed this exact line dominated Berlin's 2037 public() runtime.
+    # Grown by doubling (like a Python list's own amortized growth) rather
+    # than pre-allocated to n_locations rows, which would recreate the exact
+    # memory-pressure problem `availability` itself is memmap-backed to
+    # avoid for a megacity's full candidate pool. A newly-opened location's
+    # row starts all-zero without reading anything from the memmap - it has
+    # never been booked before, by definition of "was_unopened" below.
+    opened_pos = {}
+    opened_capacity = max(len(opened_list) * 2, 64)
+    opened_availability = np.zeros((opened_capacity, simulation_steps), dtype=availability.dtype)
+    for _loc in opened_list:
+        _loc = int(_loc)
+        opened_pos[_loc] = len(opened_pos)
+        opened_availability[opened_pos[_loc]] = availability[_loc]
+
     for idx in range(n_events):
         start = event_start_arr[idx]
         duration = event_time_arr[idx]
@@ -523,11 +553,26 @@ def distribute_charging_events(
                 pass
 
             if opened_list:
-                if len(opened_list) > max_reuse_search:
-                    search_idx = rng.choice(opened_list, size=max_reuse_search, replace=False)
+                # Sample POSITIONS (into opened_list/opened_availability),
+                # not location ids directly - opened_list's own row order
+                # exactly matches opened_availability's row order (see the
+                # mirror's own setup comment above), so a position doubles
+                # as a free index into both arrays with one vectorized
+                # gather (opened_arr[positions]) instead of a per-candidate
+                # opened_pos[...] dict lookup. A first version of this fix
+                # did exactly that per-candidate dict lookup (up to
+                # max_reuse_search of them, every single event) and measured
+                # SLOWER than the original memmap-scatter-read version it
+                # was meant to replace - the Python-level lookup loop itself
+                # dominated, not the memmap access it avoided.
+                opened_arr = np.asarray(opened_list)
+                n_opened = len(opened_arr)
+                if n_opened > max_reuse_search:
+                    positions = rng.choice(n_opened, size=max_reuse_search, replace=False)
                 else:
-                    search_idx = np.array(opened_list)
-                in_use = availability[search_idx, start:end].max(axis=1)
+                    positions = np.arange(n_opened)
+                search_idx = opened_arr[positions]
+                in_use = opened_availability[positions, start:end].max(axis=1)
                 required = charging_points[search_idx]
                 free_mask = in_use < required
                 if free_mask.any():
@@ -564,6 +609,11 @@ def distribute_charging_events(
             average_charging_capacity[assigned] = new_avg
             if was_unopened:
                 opened_list.append(assigned)
+                if len(opened_pos) >= opened_availability.shape[0]:
+                    grown = np.zeros((opened_availability.shape[0] * 2, simulation_steps), dtype=opened_availability.dtype)
+                    grown[:opened_availability.shape[0]] = opened_availability
+                    opened_availability = grown
+                opened_pos[int(assigned)] = len(opened_pos)
 
         # Reusing an existing point (Phase 1/2 above) never touches
         # average_charging_capacity - only the "open a brand-new point"
@@ -585,6 +635,9 @@ def distribute_charging_events(
             # Keep the compact mirror (see above) in sync whenever the
             # chosen location happens to be one of existing_idx's own.
             existing_availability[pos, start:end] += 1
+        # Same for opened_availability - assigned is always in opened_pos by
+        # this point (either seeded at loop start, or just added above).
+        opened_availability[opened_pos[int(assigned)], start:end] += 1
         assigned_locations[idx] = assigned
 
         if progress_step and idx % progress_step == 0:
@@ -742,10 +795,17 @@ def distribute_charging_events_per_vehicle(
     vehicle_groups = events.groupby(vehicle_column, sort=False).indices
 
     n_groups = len(vehicle_groups)
-    # Prints at most ~200 times regardless of n_groups (a big city's home
-    # charging can have 500k+ distinct vehicles) - printing every vehicle
-    # would itself become a meaningful slowdown, and swamp the console.
-    progress_step = max(1, n_groups // 200)
+    # Prints at most ~8 times regardless of n_groups (a big city's home
+    # charging can have 500k+ distinct vehicles). Was capped at ~200 prints,
+    # each a flush=True console write - across 8 use cases x 10,747
+    # Gemeinden that's up to ~17M synchronous console writes over a full
+    # nationwide run, a real wall-clock cost and suspected contributor to
+    # conhost.exe hangs observed during the 2037 run (confirmed via Windows
+    # Reliability Monitor + Application-log "Application Hang" events for
+    # conhost.exe coinciding with two of three unexplained process-tree
+    # deaths that day). Cut down to ~8 for basic progress visibility without
+    # the console-flooding volume.
+    progress_step = max(1, n_groups // 8)
 
     # Phase 1's own per-vehicle cost is already bounded by max_existing_search
     # (see below), but that only caps the WIDTH of each vehicle's search, not
@@ -1033,7 +1093,10 @@ def distribute_charging_events_household_capped(
     capacity_arr = events["station_charging_capacity"].to_numpy()
     vehicle_groups = events.groupby(vehicle_column, sort=False).indices
     n_groups = len(vehicle_groups)
-    progress_step = max(1, n_groups // 200)
+    # See distribute_charging_events_per_vehicle's own comment on this same
+    # pattern - cut from ~200 to ~8 prints per call to reduce total console
+    # I/O volume across a full nationwide run.
+    progress_step = max(1, n_groups // 8)
 
     assigned_locations = np.full(n_events, np.nan)
     has_room = charging_points < household_cap
