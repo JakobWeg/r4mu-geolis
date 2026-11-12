@@ -16,11 +16,35 @@ Two pieces:
   when it reappears (grown or not) in a later one; only genuinely new
   locations get new ids.
 """
+import os
 import pathlib
+import re
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+
+import utility
+
+
+# Registry keys are "<use_case>::<candidate_uid>". Both the internal use case
+# names (public, hpc_urban, hpc_highway - what the registry actually holds) and
+# the output spec names are accepted. candidate_uids only ever consist of
+# letters, digits and underscores, so any other character is a corrupted key.
+KEY_USE_CASES = ("home_detached", "home_apartment", "work", "retail", "depot", "public", "hpc_urban",
+                 "hpc_highway", "street", "urban_fast", "highway_fast")
+_KEY_PATTERN = re.compile(r"^(?:" + "|".join(KEY_USE_CASES) + r")::[A-Za-z0-9_]+$")
+
+
+def validate_registry_keys(keys, where: str) -> None:
+    """Fail loudly on a malformed registry key instead of silently carrying it
+    on. A single-bit flip in memory ('home_apartme~t::...') once got written to
+    disk and then made the real key look unknown in the next scenario year, so
+    that location silently received a second location_id."""
+    keys = pd.Series(keys, dtype="string")
+    bad = keys[~keys.str.match(_KEY_PATTERN, na=False)]
+    if not bad.empty:
+        raise ValueError(f"{len(bad)} invalid location registry key(s) in {where}, e.g. {bad.head(5).tolist()}")
 
 
 def merge_previous_scenario_into_candidates(candidates: gpd.GeoDataFrame,
@@ -73,6 +97,36 @@ def merge_previous_scenario_into_candidates(candidates: gpd.GeoDataFrame,
     return candidates
 
 
+def seed_home_street_columns(candidates: gpd.GeoDataFrame,
+                              previous_home_street: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Adds street_existing_points / street_existing_capacity_kw to the
+    home_apartment layer from the previous scenario's *home_street* locations
+    (use_case "street", candidate_uid "home_apartment_<N>": residential
+    buildings that street-parking residents charged at).
+
+    Why separate columns instead of existing_points/existing_capacity_kw: that
+    pair on the home_apartment layer is the apartment-wallbox seed of
+    home_apartment() itself. public()'s home_street pass places a different,
+    independent event population onto the same buildings, so it needs its own
+    seed - mixing the two would double-count. Matching is by exact
+    candidate_uid. Previously these street locations were instead fed back into
+    the public_poi (not-home) pool as orphaned candidates, so non-home events
+    (work, shopping, ...) ended up on residential buildings, and the
+    home_street pass itself restarted from zero every scenario year.
+    """
+    candidates = candidates.reset_index(drop=True).copy()
+    if previous_home_street is None or previous_home_street.empty:
+        candidates["street_existing_points"] = 0
+        candidates["street_existing_capacity_kw"] = 0.0
+        return candidates
+    lookup = previous_home_street.drop_duplicates("candidate_uid").set_index("candidate_uid")
+    candidates["street_existing_points"] = (
+        candidates["candidate_uid"].map(lookup["charging_points"]).fillna(0).astype(int))
+    candidates["street_existing_capacity_kw"] = (
+        candidates["candidate_uid"].map(lookup["average_charging_capacity"]).fillna(0.0))
+    return candidates
+
+
 class LocationRegistry:
     """Persistent candidate_uid -> location_id ledger, one file shared by an
     entire scenario chain (not per-run) - load it once per run_de.py
@@ -87,6 +141,9 @@ class LocationRegistry:
         else:
             self._table = pd.DataFrame({"candidate_uid": pd.array([], dtype="string"),
                                          "location_id": pd.array([], dtype="int64")})
+        if len(self._table):
+            validate_registry_keys(self._table["candidate_uid"], f"{self.path} (on load)")
+            assert self._table["location_id"].is_unique, f"duplicate location_id in {self.path}"
         self._lookup = dict(zip(self._table["candidate_uid"], self._table["location_id"]))
         self._next_id = int(self._table["location_id"].max()) + 1 if len(self._table) else 0
         self._new_rows = []
@@ -117,7 +174,14 @@ class LocationRegistry:
             return
         new_df = pd.DataFrame(self._new_rows, columns=["candidate_uid", "location_id"]).astype(
             {"candidate_uid": "string", "location_id": "int64"})
-        self._table = pd.concat([self._table, new_df], ignore_index=True)
+        validate_registry_keys(new_df["candidate_uid"], "new registry rows (before save)")
+        table = pd.concat([self._table, new_df], ignore_index=True)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._table.to_parquet(self.path, engine="pyarrow", index=False)
+        # Atomic: write a temp file next to the registry, then replace in one
+        # step - an interrupted/failed write can no longer leave a truncated
+        # or half-updated registry behind.
+        tmp_path = self.path.with_name(self.path.name + ".tmp")
+        table.to_parquet(tmp_path, engine="pyarrow", index=False)
+        utility.replace_with_retry(tmp_path, self.path)
+        self._table = table
         self._new_rows = []

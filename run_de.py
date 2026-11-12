@@ -77,6 +77,8 @@ MEGACITY_VEHICLE_THRESHOLD = 100_000
 # n_workers-2 workers' own (much smaller) Gemeinden plus Windows' own
 # commit-charge overhead; three would not.
 MEGACITY_CONCURRENCY = 2
+# Longest time a megacity task waits for a free slot before it starts anyway (see process_gemeinde).
+MEGACITY_SEMAPHORE_TIMEOUT_S = 24 * 3600
 
 
 # Every use case the synthetic-centroid fallback can cover - every one here
@@ -89,44 +91,25 @@ SYNTHETIC_CENTER_USE_CASES = [
     "home_apartment", "home_detached", "depot",
 ]
 
-# Every use_case.py function expects its OWN weight column name (and, for
-# retail, a whole fixed extra schema it selects columns by) - checked
-# against each function's own source directly, not assumed uniform:
-#   hpc(): weight_column="weight" (run_de.py's own hpc_urban/hpc_highway
-#     calls) - no other special columns.
-#   home(): weight_column="households_total", used as-is with no renaming/
-#     filtering.
-#   work(): weight_column=config["work_weight_column"] ("area" in every
-#     config so far), used as-is with no renaming/filtering.
-#   public(): the internal "not_home_street" candidate side always ends up
-#     selected down to just ["Weight", "geometry", ...extra_cols] (capital
-#     W) regardless of config - see use_case.py's public(). Its "home_street"
-#     side is a SEPARATE candidate source (the home_apartment layer, reused)
-#     that public() itself renames households_total->Weight - given its own
-#     synthetic-center key ("public_home_street", not "home_apartment") so
-#     its candidate_uid never collides with home_apartment()'s own,
-#     independent fallback for the same Gemeinde (both would otherwise
-#     generate the identical "synthetic_center_home_apartment_<ags>" uid for
-#     what are really two logically distinct synthetic locations).
-#   retail(): selects a FIXED real-world OSM/ALKIS schema (id_0, osm_way_id,
-#     amenity, other_tags, id, area, category, geometry) and additionally
-#     requires area > 100 OR existing_points_column > 0 to survive its own
-#     area_filter - values here are chosen to clear that filter unconditionally.
-#   depot(): needs "area" > 1 - same value as retail's works here too, no
-#     need for a separate lower one.
+# Every candidate layer (real or synthetic) carries exactly one weight column,
+# "weight" (see data_de_candidates.LAYER_CONFIG), which every use_case.py
+# function draws by. A synthetic Gemeinde-center candidate therefore only
+# needs weight=1.0; "public_home_street" is the home_apartment layer reused
+# by public()'s home-street side, with its own synthetic-center key so its
+# candidate_uid never collides with home_apartment()'s own fallback for the
+# same Gemeinde (both would otherwise generate the identical
+# "synthetic_center_home_apartment_<ags>" uid for two logically distinct
+# synthetic locations).
 SYNTHETIC_CENTER_EXTRA_COLUMNS = {
     "hpc_urban": {"weight": 1.0},
     "hpc_highway": {"weight": 1.0},
-    "home_apartment": {"households_total": 1.0},
-    "home_detached": {"households_total": 1.0},
-    "work": {"area": 150.0},
-    "public": {"Weight": 1.0},
-    "public_home_street": {"households_total": 1.0},
-    "retail": {
-        "id_0": 0, "osm_way_id": 0, "amenity": "synthetic_center", "other_tags": "synthetic_center",
-        "id": 0, "area": 150.0, "category": "synthetic_center",
-    },
-    "depot": {"area": 150.0},
+    "home_apartment": {"weight": 1.0},
+    "home_detached": {"weight": 1.0},
+    "work": {"weight": 1.0},
+    "public": {"weight": 1.0},
+    "public_home_street": {"weight": 1.0},
+    "retail": {"weight": 1.0},
+    "depot": {"weight": 1.0},
 }
 
 COLUMNS_OUTPUT_LOCATIONS = ["location_id", "charging_points", "average_charging_capacity", "candidate_uid", "geometry"]
@@ -197,7 +180,13 @@ def parse_config(config_path) -> dict:
         "charging_time_limit_duration": parser.getint("uc_params", "charging_time_limit_duration"),
         "charging_time_limit_start": parser.getint("uc_params", "charging_time_limit_start"),
         "charging_time_limit_end": parser.getint("uc_params", "charging_time_limit_end"),
-        "work_weight_column": parser.get("uc_params", "work_weight_column"),
+        # upper limit of charging points per work location (0/absent = no limit), see
+        # use_case_helpers.distribute_charging_events_per_vehicle(max_points_per_location)
+        "work_max_charging_points": parser.getint("uc_params", "work_max_charging_points", fallback=0),
+        # upper limit of charging points per one-/two-family-house address (0/absent = legacy behaviour: soft cap of
+        # 1 per address, unlimited fallback); vehicles above the limit are placed on the Gemeinde's multi-family
+        # buildings (use_case.home(max_points_per_address), see run_de main loop)
+        "home_detached_max_points": parser.getint("uc_params", "home_detached_max_points", fallback=0),
         "use_existing_infrastructure": parser.getboolean("data", "use_existing_infrastructure", fallback=False),
         "existing_infrastructure_xlsx": parser.get("data", "existing_infrastructure_xlsx", fallback=None),
         "existing_infrastructure_gpkg": parser.get("data", "existing_infrastructure_gpkg", fallback=None),
@@ -249,7 +238,9 @@ def _init_worker(config, demand_df, pool_index, prepared_dir, result_dir, synthe
 
 
 def _synthetic_center_candidate(ags: str, use_case: str) -> gpd.GeoDataFrame:
-    """One-row candidate GeoDataFrame at this Gemeinde's own centroid.
+    """One-row candidate GeoDataFrame at a point guaranteed to lie inside this
+    Gemeinde (its representative point - see main(); called "centroid"
+    elsewhere in this file for historical reasons).
 
     A genuine FALLBACK for every use case that can call this (including
     hpc_highway, see below) - only reached when that use case's real
@@ -306,6 +297,9 @@ def _base_uc_dict(config: dict, ags: str, charging_events: pd.DataFrame, gemeind
         "result_dir": gemeinde_result_dir,
         "random_seed": np.random.default_rng((config["random_seed"], int(ags))),
         "seed": config["random_seed"],
+        "ags": int(ags),
+        "work_max_points": config["work_max_charging_points"] or None,
+        "home_detached_overflow": None,
         "simulation_steps": simulation_steps,
         "columns_output_locations": COLUMNS_OUTPUT_LOCATIONS,
         "columns_output_chargingevents": COLUMNS_OUTPUT_CHARGINGEVENTS,
@@ -326,7 +320,19 @@ def _run_use_case(ags: str, uc_name: str, fn, *args, **kwargs) -> dict:
     try:
         return fn(*args, **kwargs)
     except Exception:
-        warnings.warn(f"Gemeinde {ags}: use case '{uc_name}' failed:\n{traceback.format_exc()}")
+        tb = traceback.format_exc()
+        warnings.warn(f"Gemeinde {ags}: use case '{uc_name}' failed:\n{tb}")
+        # Marker file so a failed use case cannot go unnoticed: the Gemeinde
+        # simply has no output for it, which nothing else reports.
+        # _verify_year_output.py fails the year if any FAILED_*.txt exists.
+        try:
+            result_dir = _WORKER.get("result_dir")
+            if result_dir is not None:
+                marker_dir = pathlib.Path(result_dir, "gemeinden", ags)
+                marker_dir.mkdir(parents=True, exist_ok=True)
+                (marker_dir / f"FAILED_{uc_name}.txt").write_text(tb, encoding="utf-8")
+        except OSError:
+            pass
         return None
 
 
@@ -431,15 +437,23 @@ def process_gemeinde(ags: str):
     """
     is_megacity = ags in _WORKER.get("megacity_ags", ())
     semaphore = _WORKER.get("megacity_semaphore") if is_megacity else None
+    semaphore_held = False
     if semaphore is not None:
-        semaphore.acquire()
+        # Not an unlimited blocking acquire(): a worker that dies hard (e.g. the
+        # access violations seen in earlier runs) never reaches its `finally`
+        # and keeps its slot forever, which would block every remaining
+        # megacity for good. A real megacity takes hours, never a day.
+        semaphore_held = semaphore.acquire(timeout=MEGACITY_SEMAPHORE_TIMEOUT_S)
+        if not semaphore_held:
+            warnings.warn(f"Gemeinde {ags}: megacity slot not free after {MEGACITY_SEMAPHORE_TIMEOUT_S / 3600:.0f} h "
+                          f"(a worker holding it probably died) - starting anyway")
     try:
         return _process_gemeinde(ags)
     except Exception:
         warnings.warn(f"Gemeinde {ags}: process_gemeinde failed entirely, skipping:\n{traceback.format_exc()}")
         return ags, {}
     finally:
-        if semaphore is not None:
+        if semaphore is not None and semaphore_held:
             semaphore.release()
         # Clears this worker's memmap scratch files (see use_case_helpers.
         # set_availability_scratch_dir) - every availability array created
@@ -511,6 +525,7 @@ def _process_gemeinde(ags: str):
         existing_cols = {"existing_points_column": "existing_points", "existing_capacity_column": "existing_capacity_kw"}
 
     if config["run_home"]:
+        home_candidates = {}
         for mode, layer in [("apartment", "home_apartment"), ("detached", "home_detached")]:
             candidates = dc.load_candidates(prepared_dir, layer, ags)
             if candidates.empty:
@@ -519,11 +534,19 @@ def _process_gemeinde(ags: str):
                 # candidates at all would otherwise silently drop 100% of
                 # its own home charging demand.
                 candidates = _synthetic_center_candidate(ags, layer)
+            home_candidates[mode] = candidates
+        # Detached-house overflow: with a point limit per address, detached runs FIRST and hands the vehicles that
+        # fit nowhere to the apartment run (only possible if the Gemeinde has apartment candidates at all)
+        detached_limit = (config["home_detached_max_points"] or None) if not home_candidates["apartment"].empty else None
+        home_order = ["detached", "apartment"] if detached_limit else ["apartment", "detached"]
+        for mode in home_order:
+            candidates = home_candidates[mode]
             if candidates.empty:
                 continue
             result = _run_use_case(ags, f"home_{mode}", uc.home, candidates, uc_dict, mode=mode,
                                     simulation_steps=uc_dict["simulation_steps"], vehicle_column="vehicle_id",
-                                    label=ags, **existing_cols)
+                                    label=ags, max_points_per_address=detached_limit if mode == "detached" else None,
+                                    **existing_cols)
             if result:
                 points, energy, power = result
                 results_summary[f"home_{mode}"] = {"charging_points": points, "energy_grid_kWh": energy, "installed_power": power}
@@ -533,7 +556,7 @@ def _process_gemeinde(ags: str):
         if candidates.empty:
             candidates = _synthetic_center_candidate(ags, "work")
         if not candidates.empty:
-            result = _run_use_case(ags, "work", uc.work, candidates, uc_dict, weight_column=config["work_weight_column"],
+            result = _run_use_case(ags, "work", uc.work, candidates, uc_dict, weight_column="weight",
                                     simulation_steps=uc_dict["simulation_steps"], vehicle_column="vehicle_id",
                                     label=ags, **existing_cols)
             if result:
@@ -565,23 +588,8 @@ def _process_gemeinde(ags: str):
 
     if config["run_retail"]:
         candidates = dc.load_candidates(prepared_dir, "retail", ags)
-        # retail() itself drops any candidate with area<=100 (unless it's
-        # real existing infrastructure - see its own area_filter) BEFORE
-        # placing anything - a Gemeinde can have real candidates here (so
-        # this check alone would see it as non-empty and skip the fallback)
-        # while every single one of them is too small to survive that
-        # filter, silently leaving the whole Gemeinde's retail demand
-        # unplaced with no location and no warning. Replicate retail()'s own
-        # filter here so the fallback triggers on the same emptiness retail()
-        # itself will actually see, not just on the raw candidate count.
         existing_points_column = existing_cols.get("existing_points_column")
-        nothing_survives_area_filter = False
-        if not candidates.empty:
-            usable = candidates["area"] > 100
-            if existing_points_column and existing_points_column in candidates.columns:
-                usable |= candidates[existing_points_column].fillna(0) > 0
-            nothing_survives_area_filter = not usable.any()
-        if candidates.empty or nothing_survives_area_filter:
+        if candidates.empty:
             candidates = _synthetic_center_candidate(ags, "retail")
         if not candidates.empty:
             result = _run_use_case(ags, "retail", uc.retail, candidates, uc_dict,
@@ -700,7 +708,16 @@ def main():
     # computed - every use case can fall back to one now, not just
     # hpc_highway (see SYNTHETIC_CENTER_USE_CASES / _synthetic_center_candidate).
     synthetic_center = {
-        "centroids": dict(zip(municipalities["AGS"], municipalities.geometry.centroid)),
+        # representative_point(), not centroid(): for concave/ring-shaped or
+        # multi-part Gemeinden the centroid can lie outside the Gemeinde's own
+        # polygon (in a neighbour). The synthetic candidate carried forward to
+        # the next scenario year is then spatially joined to the NEIGHBOUR
+        # (data_de_candidates.assign_ags), while its own Gemeinde falls back to
+        # a second synthetic candidate with the same candidate_uid - seeded
+        # twice, in two Gemeinden. 270 (2037) / 286 (2045) of ~26-29k synthetic
+        # centres were affected. representative_point() is guaranteed to lie
+        # inside the polygon. (Dict key stays "centroids" for the workers.)
+        "centroids": dict(zip(municipalities["AGS"], municipalities.geometry.representative_point())),
         "existing": {},
         "crs": municipalities.crs,
     }

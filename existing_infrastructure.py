@@ -236,8 +236,11 @@ def merge_existing_into_candidates(candidates: gpd.GeoDataFrame, matches: gpd.Ge
         )
         if weight_column and weight_column in candidates.columns:
             # nominal weight so an unmatched existing site can still receive
-            # additional new points later if demand exceeds what it already has
-            new_rows[weight_column] = new_rows["existing_points"].clip(lower=1)
+            # additional new points later if demand exceeds what it already has:
+            # the layer's smallest positive weight (weights are scaled to a max
+            # of 1, so a points-count weight would outrank every real candidate)
+            positive = candidates[weight_column][candidates[weight_column] > 0]
+            new_rows[weight_column] = float(positive.min()) if len(positive) else 1.0
         if "candidate_uid" in candidates.columns:
             # Each unmatched facility is its own new candidate row - without
             # a real, stable identity here they'd all fall through to the

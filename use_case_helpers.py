@@ -1,4 +1,5 @@
 import os
+import pathlib
 import tempfile
 
 import plots as plots
@@ -207,6 +208,24 @@ def postprocess_public_demands(charging_locations: gpd.GeoDataFrame, located_cha
     charging_locations.loc[decrease_mask, "charging_points"] = demand_aligned[decrease_mask].astype(int)
     charging_locations = charging_locations.reset_index(drop=True)
 
+    # Installed power: events were moved between locations above, so the power
+    # computed in distribute_charging_events() no longer matches. Recompute it as
+    # the peak simultaneous nominal power of the events now sitting at each
+    # location (same definition as installed_capacity_from_peak), never below the
+    # installed power the location was seeded with (column seed_installed_kw,
+    # set in use_case.public(); absent = no seed).
+    row_of_location = pd.Index(charging_locations["location_id"]).get_indexer(located_charging_events["location_id"])
+    assigned = np.where(row_of_location >= 0, row_of_location, np.nan).astype(np.float64)
+    ev_start = located_charging_events["event_start"].to_numpy()
+    peak_power = peak_power_per_location(
+        assigned, ev_start, ev_start + located_charging_events["event_time"].to_numpy(),
+        located_charging_events["station_charging_capacity"].to_numpy(), len(charging_locations))
+    seed_installed = (charging_locations["seed_installed_kw"].fillna(0).to_numpy(dtype=np.float64)
+                      if "seed_installed_kw" in charging_locations.columns else np.zeros(len(charging_locations)))
+    points_now = charging_locations["charging_points"].to_numpy(dtype=np.float64)
+    installed = np.maximum(peak_power, seed_installed)
+    charging_locations["average_charging_capacity"] = np.rint(
+        np.where(points_now > 0, installed / np.maximum(points_now, 1), 0.0)).astype(int)
 
     return charging_locations, located_charging_events
 
@@ -219,10 +238,18 @@ def park_time_limitation(charging_events, data_dict, charging_use_case):
     #         return row['energy'] / row['station_charging_capacity'] * 4
     #     return min(row['event_time'], limit_schritte)
 
-    limit_schritte = data_dict["charging_time_limit_duration"] # 4h
-    tag_laenge = 96 # 24h
-    start_grenze = data_dict["charging_time_limit_start"] # 9:00
-    end_grenze = data_dict["charging_time_limit_end"] # 21:00
+    # Die Config-Werte (charging_time_limit_duration/_start/_end) sind Stunden
+    # bzw. Uhrzeiten (4 / 9 / 21), die Zeitachse der Ereignisse läuft aber in
+    # 15-Minuten-Schritten (SimBEV stepsize 15, 96 Schritte je Tag). Bis
+    # 2026-10-22 wurden die Config-Werte unverändert als Schritte gelesen
+    # (Fenster 02:15-05:15 Uhr, Limit 1 h statt 09:00-21:00 Uhr und 4 h) - die
+    # beabsichtigte Tagesbegrenzung griff nie, nachts wurden Ereignisse zu
+    # Unrecht gekürzt. Deshalb hier einmal Stunden -> Schritte umrechnen.
+    tag_laenge = 96 # 24h in 15-Minuten-Schritten
+    schritte_je_stunde = tag_laenge // 24 # 4
+    limit_schritte = data_dict["charging_time_limit_duration"] * schritte_je_stunde # 4h -> 16
+    start_grenze = data_dict["charging_time_limit_start"] * schritte_je_stunde # 9:00 -> 36
+    end_grenze = data_dict["charging_time_limit_end"] * schritte_je_stunde # 21:00 -> 84
 
     def begrenze_event(start, dauer, lade):
         ende = start + dauer
@@ -289,6 +316,30 @@ def park_time_limitation(charging_events, data_dict, charging_use_case):
 
     return df.drop(columns=['original_event_time'])
 
+def check_event_loss(uc_id, n_before, n_after, uc_dict):
+    """Warn (and leave a marker file) when the merge of events with their
+    assigned locations dropped events. distribute_charging_events() gives
+    events NaN as location when a Gemeinde has no candidate at all for the use
+    case, and the inner merge in use_case.py then removes those events without
+    any message - the charged energy simply vanishes from that Gemeinde's
+    output. The marker file WARNING_event_loss_<use_case>.txt in the Gemeinde's
+    result dir is picked up by _verify_year_output.py (gate before the raw
+    dir is deleted)."""
+    if n_after == n_before:
+        return
+    lost = n_before - n_after
+    msg = (f"WARNING: use case '{uc_id}': {lost:,} of {n_before:,} charging events were not placed "
+           f"(no location assigned) and are missing from the output")
+    utility.safe_print(msg)
+    try:
+        result_dir = uc_dict.get("result_dir")
+        if result_dir is not None:
+            marker = pathlib.Path(result_dir) / f"WARNING_event_loss_{uc_id}.txt"
+            marker.write_text(f"{msg}\nbefore={n_before}\nafter={n_after}\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def get_id(use_case_id, location_id):
 
     # todo: eliminate float in ids
@@ -318,6 +369,50 @@ def get_id(use_case_id, location_id):
     ids = (uc_id + location_id.astype(str)).astype(int)
 
     return ids.values.astype(int)
+
+def peak_power_per_location(assigned, starts, ends, capacities, n_locations):
+    """Peak over time of the SUM of the nominal (maximum) charging power of all
+    events that occupy a location at the same time (half-open windows
+    [start, end)). One sweep over the sorted start/end times of all placed
+    events - independent of the order the events were assigned in.
+
+    assigned: float array, location index per event (NaN = unplaced).
+    Returns a float array of length n_locations (0 for locations without events).
+    """
+    placed = ~np.isnan(assigned)
+    out = np.zeros(n_locations, dtype=np.float64)
+    if not placed.any():
+        return out
+    loc = assigned[placed].astype(np.int64)
+    start = np.asarray(starts)[placed].astype(np.int64)
+    end = np.maximum(np.asarray(ends)[placed].astype(np.int64), start + 1)
+    power = np.asarray(capacities)[placed].astype(np.float64)
+    width = (int(end.max()) + 1) * 2
+    # at equal time a window that ends sorts before one that starts (half-open)
+    keys = np.concatenate([loc * width + start * 2 + 1, loc * width + end * 2])
+    delta = np.concatenate([power, -power])
+    order = np.argsort(keys, kind="stable")
+    keys = keys[order]
+    running = np.cumsum(delta[order])  # returns to 0 after the last event of every location
+    seg = keys // width
+    first = np.concatenate([[0], np.flatnonzero(np.diff(seg)) + 1])
+    out[seg[first]] = np.maximum.reduceat(running, first)
+    return out
+
+
+def installed_capacity_from_peak(charging_points, seed_points, seed_capacity, peak_power):
+    """Mean power per charging point such that charging_points * mean equals the
+    installed power of the location: the peak simultaneous nominal power of its
+    events, but never less than the installed power it was seeded with (real
+    BNetzA / previous-year capacity: seed_points * seed_capacity).
+
+    Replaces the old running mean with a "bump to the maximum" rule, whose
+    result depended on the order of the events: points with 22 kW and 150 kW
+    events could end up rated 3 x 150 kW although at most 2 x 150 + 22 kW were
+    ever needed at the same time."""
+    installed = np.maximum(seed_points * seed_capacity, peak_power)
+    return np.where(charging_points > 0, installed / np.maximum(charging_points, 1), 0.0)
+
 
 def distribute_charging_events(
     locations: gpd.GeoDataFrame,
@@ -441,7 +536,17 @@ def distribute_charging_events(
     # Gemeinden) on Kiel/Luebeck's home_apartment/home_detached candidates.
     # uint8 halves this vs. the previous int16 (an 8x reduction vs. the
     # platform default int64).
-    availability = _new_availability_array(n_locations, simulation_steps, np.uint8)
+    # uint16 (changed from uint8, 2026-10-21): the "94 charging_points was the
+    # largest ever observed" assumption above does not hold at the 2037/2045
+    # fleet sizes - a single hpc_highway/retail/depot site can need >255
+    # simultaneous points. With uint8 the occupancy counter wraps at 256 and
+    # `in_use < required` (required = charging_points = 256 > uint8 max 255)
+    # then stays true forever, so the site accepts every further event without
+    # opening new points: charging_points freezes at exactly 256 while the real
+    # concurrent load reaches ~10x the installed power (confirmed: 99-102
+    # locations with exactly 256 points in 2037/2045, 33-42 of them overloaded).
+    # uint16 allows up to 65,535 simultaneous points per site.
+    availability = _new_availability_array(n_locations, simulation_steps, np.uint16)
 
     # Plain numpy arrays instead of DataFrame .at[]/.values lookups inside the
     # hot loop, and the "reuse if free" search below is restricted to
@@ -468,6 +573,8 @@ def distribute_charging_events(
     # e.g. by area/POI density). Captured once, before the loop, so this
     # weighting reflects the real installed capacity even if a location
     # later gains additional simulated points via the normal fallback path.
+    seed_points = charging_points.copy()          # installed capacity this location was seeded with
+    seed_capacity = average_charging_capacity.copy()
     existing_idx = np.nonzero(charging_points)[0]
     existing_weight = charging_points[existing_idx].astype(np.float64)
     # Compact, contiguous mirror of just existing_idx's own rows of
@@ -644,8 +751,14 @@ def distribute_charging_events(
             percent = (idx + 1) / n_events * 100
 
 
+    # Installed power = peak simultaneous nominal power of the placed events (see
+    # installed_capacity_from_peak). The running mean / bump rule inside the loop
+    # above is not used for the result any more.
+    peak_power = peak_power_per_location(assigned_locations, event_start_arr,
+                                         event_start_arr + event_time_arr, capacity_arr, n_locations)
+    average_charging_capacity = installed_capacity_from_peak(charging_points, seed_points, seed_capacity, peak_power)
     locations["charging_points"] = charging_points
-    locations["average_charging_capacity"] = average_charging_capacity.astype(int)
+    locations["average_charging_capacity"] = np.rint(average_charging_capacity).astype(int)  # gerundet (früher abgeschnitten: 36,9 -> 36)
 
     events = events.copy()
     events["assigned_location"] = assigned_locations + location_id_start
@@ -671,6 +784,7 @@ def distribute_charging_events_per_vehicle(
     existing_points_column: str = None,
     existing_capacity_column: str = None,
     label: str = None,
+    max_points_per_location: int = None,
 ):
     """
     Same idea as distribute_charging_events (fill_existing_first=True), but
@@ -713,6 +827,18 @@ def distribute_charging_events_per_vehicle(
     making total work O(n_vehicles^2) again regardless of how fast each
     individual check is - the same class of blowup Phase 1 had, just via
     list growth instead of an unbounded per-candidate Python loop.
+
+    max_points_per_location (None = no limit): once a location has this many
+    charging points, no further points are OPENED there - the fallback draw
+    (a vehicle that fits nowhere yet) then only picks among locations still
+    below the limit. Re-using free capacity (Phase 1/2) never adds points and
+    is unaffected, and a vehicle whose windows overlap several already-booked
+    slots can push a location marginally past the limit (needed > 1), since
+    clipping would break "concurrent vehicles <= charging_points". Only if
+    EVERY location is at the limit does a vehicle fall back to the uncapped
+    draw (counted and reported at the end). Used for work(): the area-based
+    candidate weights are extremely skewed, so single employers otherwise
+    collect thousands of charging points.
     """
     n_locations = len(locations)
     n_events = len(events)
@@ -765,6 +891,8 @@ def distribute_charging_events_per_vehicle(
     # point count rather than the generic weight_column (see
     # distribute_charging_events() for the full rationale) - captured once,
     # before any vehicle grows a location's charging_points further.
+    seed_points = charging_points.copy()          # installed capacity this location was seeded with
+    seed_capacity = average_charging_capacity.copy()
     existing_idx = np.nonzero(charging_points)[0]
     existing_weight = charging_points[existing_idx].astype(np.float64)
 
@@ -839,9 +967,19 @@ def distribute_charging_events_per_vehicle(
     # alone would place there.
     opened_list = list(existing_idx)
 
+    capped = max_points_per_location is not None
+    if capped:
+        has_room = charging_points < max_points_per_location
+        capped_dirty = True       # draw distribution is rebuilt lazily, only when a location becomes full
+        capped_probs = None
+        n_cap_fallbacks = 0
+
     for g_idx, rows in enumerate(vehicle_groups.values()):
         starts = event_start_arr[rows]
-        ends = starts + event_time_arr[rows]
+        # at least one time step: a zero-length window would be skipped by every
+        # check below (max_needed stays 0), leaving the event assigned to a
+        # location that never gets a charging point and drops out of the output
+        ends = starts + np.maximum(event_time_arr[rows], 1)
         windows = list(zip(starts, ends))
 
         assigned = None
@@ -943,7 +1081,25 @@ def distribute_charging_events_per_vehicle(
                     assigned = search_pool[first_fit[0]]
 
         if assigned is None:
-            assigned = rng.choice(n_locations, p=probabilities)
+            if capped:
+                if capped_dirty:
+                    pool_weights = probabilities * has_room
+                    pool_sum = pool_weights.sum()
+                    if pool_sum > 0:
+                        capped_probs = pool_weights / pool_sum
+                    elif has_room.any():
+                        capped_probs = has_room / has_room.sum()
+                    else:
+                        capped_probs = None
+                    capped_dirty = False
+                if capped_probs is not None:
+                    assigned = rng.choice(n_locations, p=capped_probs)
+                else:
+                    # every location is at the limit: rather than leaving the vehicle unplaced
+                    n_cap_fallbacks += 1
+                    assigned = rng.choice(n_locations, p=probabilities)
+            else:
+                assigned = rng.choice(n_locations, p=probabilities)
             was_unopened = charging_points[assigned] == 0
             # How much capacity is missing to fit every window of this
             # vehicle at the chosen location (usually 1, but a fallback pick
@@ -961,6 +1117,9 @@ def distribute_charging_events_per_vehicle(
                 new_avg = (prev_avg * prev_count + capacity_arr[rows].mean() * max_needed) / (prev_count + max_needed)
                 charging_points[assigned] += max_needed
                 average_charging_capacity[assigned] = new_avg
+                if capped and has_room[assigned] and charging_points[assigned] >= max_points_per_location:
+                    has_room[assigned] = False
+                    capped_dirty = True
             if was_unopened and charging_points[assigned] > 0:
                 opened_list.append(assigned)
 
@@ -1001,7 +1160,15 @@ def distribute_charging_events_per_vehicle(
         utility.safe_print("")
 
     locations["charging_points"] = charging_points
-    locations["average_charging_capacity"] = average_charging_capacity.astype(int)
+    # Installed power = peak simultaneous nominal power of the placed events (see
+    # installed_capacity_from_peak); the running mean / bump rule in the loop is not used any more.
+    peak_power = peak_power_per_location(assigned_locations, event_start_arr,
+                                         event_start_arr + np.maximum(event_time_arr, 1), capacity_arr, n_locations)
+    average_charging_capacity = installed_capacity_from_peak(charging_points, seed_points, seed_capacity, peak_power)
+    locations["average_charging_capacity"] = np.rint(average_charging_capacity).astype(int)  # gerundet (früher abgeschnitten: 36,9 -> 36)
+    if capped and n_cap_fallbacks:
+        utility.safe_print(f"WARNING: {label or 'distribute_charging_events_per_vehicle'}: {n_cap_fallbacks:,} vehicle(s) "
+                           f"placed above max_points_per_location={max_points_per_location} (every location already at the limit)")
 
     events = events.copy()
     events["assigned_location"] = assigned_locations + location_id_start
@@ -1016,12 +1183,14 @@ def distribute_charging_events_household_capped(
     events: pd.DataFrame,
     weight_column: str,
     vehicle_column: str,
-    household_column: str,
+    household_column: str = None,
     rng: np.random.Generator = None,
     location_id_start: int = 0,
     existing_points_column: str = None,
     existing_capacity_column: str = None,
     label: str = None,
+    max_points_per_address: int = None,
+    return_overflow: bool = False,
 ):
     """
     Simplified home_detached placement - no time-window/availability
@@ -1047,9 +1216,21 @@ def distribute_charging_events_household_capped(
     better to slightly over-assign one address than leave a vehicle
     unplaced (mirrors distribute_charging_events_per_vehicle's own
     existing-infra-then-fallback pattern, just without the time dimension).
+
+    max_points_per_address (None = legacy behaviour above): hard upper limit of
+    charging points per address (a one-/two-family house: 1-2 households).
+    Addresses are filled in tiers - first every address up to 1 point, then up
+    to 2, ... up to the limit. A vehicle that finds no address below the limit
+    is NOT placed here: its events are returned separately as `overflow_events`
+    (return_overflow must be True) so the caller can place them elsewhere
+    (use_case.home(): on the Gemeinde's multi-family buildings). The installed
+    power of an address is then the peak simultaneous nominal power of its
+    events, like in distribute_charging_events_per_vehicle.
     """
     n_locations = len(locations)
     n_events = len(events)
+    tiered = max_points_per_address is not None
+    assert not tiered or return_overflow, "max_points_per_address needs return_overflow=True"
 
     if n_locations == 0:
         locations = locations.reset_index().copy()
@@ -1058,13 +1239,18 @@ def distribute_charging_events_household_capped(
         locations.index = locations.index + location_id_start
         events = events.copy()
         events["assigned_location"] = np.full(n_events, np.nan)
+        if tiered:
+            return locations, events.iloc[0:0], events.drop(columns="assigned_location")
         return locations, events
 
     weights = locations[weight_column].fillna(0).to_numpy().astype(np.float64)
     # Never below 1: a candidate with an unknown/zero household count should
     # still be able to host at least one vehicle rather than being
     # permanently excluded from the capped pool below.
-    household_cap = np.maximum(locations[household_column].fillna(1).to_numpy().astype(np.int64), 1)
+    # No household column (the published candidate files only carry a weight): one
+    # charging point per address and year.
+    household_cap = (np.ones(n_locations, dtype=np.int64) if household_column is None
+                     else np.maximum(locations[household_column].fillna(1).to_numpy().astype(np.int64), 1))
     locations = locations.reset_index().copy()
 
     # existing_points: real, already-installed wallboxes carried forward
@@ -1099,6 +1285,9 @@ def distribute_charging_events_household_capped(
     progress_step = max(1, n_groups // 8)
 
     assigned_locations = np.full(n_events, np.nan)
+    if tiered:
+        household_cap = np.ones(n_locations, dtype=np.int64)  # current tier: 1, then 2, ... max_points_per_address
+        tier = 1
     has_room = charging_points < household_cap
     # How many of an address's real existing wallboxes are still unclaimed
     # by one of THIS year's vehicles - decremented as Phase 1 below assigns
@@ -1107,6 +1296,14 @@ def distribute_charging_events_household_capped(
     # full for the year.
     existing_unclaimed = existing_points.copy()
     existing_idx = np.nonzero(existing_points)[0]
+
+    def _progress(g_idx):
+        if g_idx % progress_step == 0 or g_idx == n_groups - 1:
+            percent = (g_idx + 1) / n_groups * 100
+            utility.safe_print(
+                f"\r--- {label or 'distribute_charging_events_household_capped'}: "
+                f"{g_idx + 1}/{n_groups} vehicles ({percent:.1f}%) ---",
+                end="", flush=True)
 
     for g_idx, rows in enumerate(vehicle_groups.values()):
         assigned = None
@@ -1124,6 +1321,16 @@ def distribute_charging_events_household_capped(
                 weight_sum = free_weights.sum()
                 assigned = int(rng.choice(free_existing, p=free_weights / weight_sum)
                                if weight_sum > 0 else rng.choice(free_existing))
+
+        if assigned is None and tiered and not has_room.any():
+            # every address is at the current tier: open the next one, or - at the limit - hand the vehicle back
+            while tier < max_points_per_address and not has_room.any():
+                tier += 1
+                household_cap[:] = tier
+                has_room = charging_points < household_cap
+            if not has_room.any():
+                _progress(g_idx)
+                continue          # assigned_locations stays NaN -> overflow event, placed by the caller
 
         if assigned is None:
             if has_room.any():
@@ -1149,22 +1356,27 @@ def distribute_charging_events_household_capped(
             has_room[assigned] = False
         assigned_locations[rows] = assigned
 
-        if g_idx % progress_step == 0 or g_idx == n_groups - 1:
-            percent = (g_idx + 1) / n_groups * 100
-            utility.safe_print(
-                f"\r--- {label or 'distribute_charging_events_household_capped'}: "
-                f"{g_idx + 1}/{n_groups} vehicles ({percent:.1f}%) ---",
-                end="", flush=True)
+        _progress(g_idx)
     if n_groups:
         utility.safe_print("")
 
+    if tiered:
+        # installed power = peak simultaneous nominal power of the events at the address (1-2 vehicles)
+        ev_start = events["event_start"].to_numpy()
+        peak_power = peak_power_per_location(assigned_locations, ev_start, ev_start + np.maximum(events["event_time"].to_numpy(), 1),
+                                             capacity_arr, n_locations)
+        average_charging_capacity = np.where(charging_points > 0, peak_power / np.maximum(charging_points, 1), 0.0)
+
     locations["charging_points"] = charging_points
-    locations["average_charging_capacity"] = average_charging_capacity.astype(int)
+    locations["average_charging_capacity"] = np.rint(average_charging_capacity).astype(int)  # gerundet (früher abgeschnitten: 36,9 -> 36)
 
     events = events.copy()
     events["assigned_location"] = assigned_locations + location_id_start
     locations.index = locations.index + location_id_start
 
+    if tiered:
+        overflow = np.isnan(assigned_locations)
+        return locations, events[~overflow], events[overflow].drop(columns="assigned_location")
     return locations, events
 
 

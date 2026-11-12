@@ -184,7 +184,12 @@ def _convert_pool_file(paths: tuple) -> None:
             # Coerce defensively.
             profile[numeric_col] = pd.to_numeric(profile[numeric_col], errors="coerce")
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    profile.to_parquet(cache_path, index=False)
+    # Atomic: an interrupted write used to leave a truncated cache file that
+    # the `cache_path.exists()` check above (and prepare_pool_cache's
+    # to_convert filter) then treated as converted forever.
+    tmp_path = cache_path.with_name(cache_path.name + ".tmp")
+    profile.to_parquet(tmp_path, index=False)
+    utility.replace_with_retry(tmp_path, cache_path)
 
 
 def prepare_pool_cache(pool_dir, index: dict, n_workers: int = None) -> dict:

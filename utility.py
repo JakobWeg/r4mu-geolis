@@ -2,12 +2,32 @@ import geopandas as gpd
 import pandas as pd
 import os
 import math
+import time
 import datetime
 from datetime import timedelta
 #import matplotlib.pyplot as plt
 
 import geopandas as gpd
 from shapely.geometry import Point
+
+
+def replace_with_retry(src, dst, attempts=60, delay=1.0):
+    """os.replace() that retries on PermissionError.
+
+    On Windows a just-written file or directory is often held open for a moment
+    by a virus scanner or indexer, and renaming it then fails with
+    "[WinError 5] Zugriff verweigert" - seen when a freshly written candidate
+    layer directory was renamed into place. The atomic "write to a temp name,
+    then rename" pattern needs the rename to succeed, so wait and try again.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
 
 
 def safe_print(*args, **kwargs):

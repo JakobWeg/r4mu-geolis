@@ -836,6 +836,21 @@ def process_gemeinde(ags: str, gemeinde_dir: pathlib.Path, vehicle_profile_path:
         mapped = np.array([key_to_global_loc.get(k, np.nan) for k in row_keys_np])
         mapped_use_case = np.array([key_to_use_case.get(k, np.nan) for k in row_keys_np], dtype=object)
         valid = ~pd.isna(mapped)
+        # Same discipline as event_id_start_per_row's guard above: a row with
+        # a real location_id/location_use_case in vp whose key still isn't in
+        # key_to_global_loc means used_keys (built from this same vp a few
+        # lines up) and this lookup disagree about this row's own data within
+        # one function call - confirmed in practice to happen (2045 dataset,
+        # 2026-09-28: 4 vehicle instances each silently lost every one of
+        # their own placements this way, traced via a placement-gap audit).
+        # Raise here instead of silently dropping the row, so this one
+        # Gemeinde is cleanly skipped and flagged by the caller's per-Gemeinde
+        # try/except, exactly like the analogous profile-lookup guard above.
+        if not valid.all():
+            bad_keys = sorted(set(row_keys_np[~valid]))
+            raise ValueError(
+                f"{int((~valid).sum())} row(s) have a location assigned in vehicle_profiles "
+                f"but no matching entry in this Gemeinde's own key_to_global_loc: {bad_keys[:5]}")
         n_mapped = int(valid.sum())
         ev_mapping_event_loc_rows = pd.DataFrame({
             "id": np.arange(n_mapped, dtype=np.int64) + offsets["mapping_event_loc"],

@@ -47,10 +47,10 @@ import configparser as cp
 import datetime
 import json
 import pathlib
+import shutil
 import subprocess
 import sys
 import time
-import traceback
 import warnings
 
 import geopandas as gpd
@@ -61,6 +61,7 @@ import pyarrow.parquet as pq
 
 import location_registry as lr
 import restructure_output as ro
+import utility
 import vehicle_input as vi
 
 MAX_BATCH_RETRIES = 6
@@ -74,13 +75,43 @@ MAX_BATCH_RETRIES = 6
 # processed so far, unlike the vehicle/event tables which scale with demand).
 # --------------------------------------------------------------------------
 
-def _load_state(checkpoint_dir: pathlib.Path):
-    offsets_path = checkpoint_dir / "offsets.json"
-    registry_path = checkpoint_dir / "profile_registry.parquet"
-    if offsets_path.is_file():
-        offsets = json.loads(offsets_path.read_text())
-    else:
-        offsets = {"ev": 0, "event": 0, "mapping_muni": 0, "mapping_event_loc": 0, "location": 0}
+def _atomic_write_text(path: pathlib.Path, text: str) -> None:
+    """Write via a temp file in the same directory, then replace in one step."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    utility.replace_with_retry(tmp, path)
+
+
+def _state_paths(checkpoint_dir: pathlib.Path, batch_index: int):
+    stem = f"state_{batch_index:05d}"
+    return checkpoint_dir / f"{stem}_offsets.json", checkpoint_dir / f"{stem}_profile_registry.parquet"
+
+
+def _load_state(checkpoint_dir: pathlib.Path, before_batch: int):
+    """The state a batch starts from: the state saved AFTER batch before_batch-1.
+
+    One state snapshot per batch (state_<NNNNN>_*) instead of one mutable
+    "latest" file: a retry of batch i must always start from the snapshot of
+    batch i-1, whatever happened in the previous attempt. With a single
+    "latest" state a crash after _save_state() but before the .done marker left
+    the already-advanced state on disk; the retry then found batch i's new
+    profiles registered as "already written", skipped their ev_pool/ev_event
+    rows and overwrote the complete shards with incomplete ones - invisible to
+    every later check. Pass len(batches) to get the final state after the last
+    batch.
+    """
+    if before_batch <= 0:
+        return {"ev": 0, "event": 0, "mapping_muni": 0, "mapping_event_loc": 0, "location": 0}, {}
+    offsets_path, registry_path = _state_paths(checkpoint_dir, before_batch - 1)
+    if not offsets_path.is_file():
+        legacy_offsets = checkpoint_dir / "offsets.json"
+        if not legacy_offsets.is_file():
+            raise RuntimeError(f"missing checkpoint state {offsets_path.name} for the start of batch {before_batch} "
+                               f"- refusing to start from zero offsets")
+        # checkpoint dir written by the previous (single "latest" state) version - resume as before
+        print(f"WARNING: no versioned state for batch {before_batch - 1}, using legacy offsets.json", flush=True)
+        offsets_path, registry_path = legacy_offsets, checkpoint_dir / "profile_registry.parquet"
+    offsets = json.loads(offsets_path.read_text())
     if registry_path.is_file():
         df = pd.read_parquet(registry_path)
         profile_registry = {
@@ -92,20 +123,29 @@ def _load_state(checkpoint_dir: pathlib.Path):
     return offsets, profile_registry
 
 
-def _save_state(checkpoint_dir: pathlib.Path, offsets: dict, profile_registry: dict):
+def _save_state(checkpoint_dir: pathlib.Path, offsets: dict, profile_registry: dict, batch_index: int):
+    """Snapshot of the state after batch_index (atomic writes, see _load_state)."""
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    (checkpoint_dir / "offsets.json").write_text(json.dumps(offsets))
+    offsets_path, registry_path = _state_paths(checkpoint_dir, batch_index)
     if profile_registry:
         df = pd.DataFrame(
             [{"source_file": sf, "ev_id": v["ev_id"], "event_id_start": v["event_id_start"]}
              for sf, v in profile_registry.items()]
         )
-        # Atomic-ish: write to a temp file then replace, so a crash mid-write
-        # can never leave a half-written profile_registry.parquet that the
-        # NEXT batch would silently load as truncated/corrupt.
-        tmp = checkpoint_dir / "profile_registry.parquet.tmp"
+        tmp = registry_path.with_name(registry_path.name + ".tmp")
         df.to_parquet(tmp, engine="pyarrow", index=False)
-        tmp.replace(checkpoint_dir / "profile_registry.parquet")
+        utility.replace_with_retry(tmp, registry_path)
+    # offsets last: its existence marks the snapshot as complete
+    _atomic_write_text(offsets_path, json.dumps(offsets))
+
+
+def _drop_state(checkpoint_dir: pathlib.Path, batch_index: int) -> None:
+    """Best-effort cleanup of a snapshot no retry can need any more."""
+    for path in _state_paths(checkpoint_dir, batch_index):
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def _batch_done_marker(checkpoint_dir: pathlib.Path, batch_index: int) -> pathlib.Path:
@@ -133,7 +173,7 @@ def run_worker(args):
     batches = json.loads((checkpoint_dir / "batches.json").read_text())
     ags_list = batches[args.batch_index]
 
-    offsets, profile_registry = _load_state(checkpoint_dir)
+    offsets, profile_registry = _load_state(checkpoint_dir, args.batch_index)
     registry = lr.LocationRegistry(pathlib.Path(args.location_registry_path))
 
     demand_df = vi.load_municipality_demand(args.vehicle_input_file)
@@ -154,14 +194,32 @@ def run_worker(args):
         if rs7_code is None:
             print(f"WARNING: no RegioStaR7 code for AGS {ags}, skipping", flush=True)
             continue
-        try:
-            (ev_pool_rows, mapping_muni_rows, location_rows,
-             ev_event_rows, mapping_event_loc_rows) = ro.process_gemeinde(
-                ags, gemeinden_dir / ags, vp_path, rs7_code, offsets, registry, profile_registry, args.eta_cp
-            )
-        except Exception:
-            warnings.warn(f"Gemeinde {ags}: consolidation failed, skipping:\n{traceback.format_exc()}")
-            continue
+        # No per-Gemeinde try/except here (there used to be one, warning and
+        # `continue`-ing past a failed Gemeinde): process_gemeinde() mutates
+        # `offsets` and `profile_registry` - both shared, in-place, across
+        # the whole batch - well before it finishes building this Gemeinde's
+        # rows, so a failure partway through leaves a profile_registry entry
+        # with a real event_id_start but no matching event rows ever written
+        # (a "ghost" profile silently reused, with wrong/missing data, by
+        # every later Gemeinde nationwide that happens to draw the same
+        # SimBEV file). Confirmed in production: batches 21 and 103 each hit
+        # a transient corruption (bit-flip-style ValueError/UnicodeDecode-
+        # Error/ArrowException) on their first affected Gemeinde, then
+        # silently dropped EVERY SUBSEQUENT Gemeinde in that batch the same
+        # way (53/60 and 43/60 respectively) while still exiting 0 and
+        # getting checkpointed as done - invisible until checked for
+        # explicitly. Letting the exception propagate instead crashes this
+        # worker subprocess (non-zero exit), which the orchestrator already
+        # retries up to MAX_BATCH_RETRIES times in a fresh subprocess with
+        # no carried-over corruption - the same mechanism that has already
+        # recovered batches 18, 22, 100 and (partially) 103 cleanly this
+        # session. A batch that fails all retries surfaces loudly via
+        # run_orchestrator's RuntimeError instead of silently shipping a
+        # batch missing most of its Gemeinden.
+        (ev_pool_rows, mapping_muni_rows, location_rows,
+         ev_event_rows, mapping_event_loc_rows) = ro.process_gemeinde(
+            ags, gemeinden_dir / ags, vp_path, rs7_code, offsets, registry, profile_registry, args.eta_cp
+        )
         ev_pool_batches.append(ev_pool_rows)
         mapping_muni_batches.append(mapping_muni_rows)
         if location_rows is not None:
@@ -202,8 +260,10 @@ def run_worker(args):
     pq.write_table(mapping_table, shard_paths["mapping_event_loc"], row_group_size=1_000_000, **ro.MAPPING_EVENT_LOC_ENCODING)
 
     registry.save()
-    _save_state(checkpoint_dir, offsets, profile_registry)
-    _batch_done_marker(checkpoint_dir, args.batch_index).write_text(datetime.datetime.now().isoformat())
+    _save_state(checkpoint_dir, offsets, profile_registry, args.batch_index)
+    _atomic_write_text(_batch_done_marker(checkpoint_dir, args.batch_index), datetime.datetime.now().isoformat())
+    # The previous snapshot was only needed to (re)start THIS batch.
+    _drop_state(checkpoint_dir, args.batch_index - 1)
     print(f"--- batch {args.batch_index} done ({len(ags_list)} Gemeinden, "
           f"offsets={offsets}) ---", flush=True)
 
@@ -348,7 +408,7 @@ def run_orchestrator(args):
     ev_count_municipality["rs7_id"] = ev_count_municipality["ags"].map(rs7_per_ags).astype(np.int8)
     ev_count_municipality.to_parquet(out_dir / "ev_count_municipality.parquet", engine="pyarrow", index=False)
 
-    offsets, _ = _load_state(checkpoint_dir)
+    offsets, _ = _load_state(checkpoint_dir, len(batches))
     print(f"--- done: {offsets['mapping_muni']} sampled vehicle instances ({offsets['ev']} distinct EVs/pool profiles, "
           f"{offsets['event']} event rows), {offsets['location']} locations, "
           f"{offsets['mapping_event_loc']} event-location mappings ---", flush=True)
@@ -366,7 +426,6 @@ def run_orchestrator(args):
     if simbev_pool_dir:
         simbev_metadata_src = pathlib.Path(simbev_pool_dir) / "metadata_simbev_run.json"
         if simbev_metadata_src.is_file():
-            import shutil
             shutil.copyfile(simbev_metadata_src, out_dir / "metadata_simbev_run.json")
         else:
             warnings.warn(f"metadata_simbev_run.json not found at {simbev_metadata_src} - "

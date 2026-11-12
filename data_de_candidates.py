@@ -9,6 +9,7 @@ of doing a spatial join per task. This also sidesteps Windows' multiprocessing
 nationwide candidate set into every worker process.
 """
 import pathlib
+import shutil
 
 import geopandas as gpd
 import pandas as pd
@@ -22,8 +23,8 @@ import utility
 # the weight_column each one uses (see LAYER_CONFIG below).
 EXISTING_INFRASTRUCTURE_LAYERS = {"retail", "public_poi", "hpc_urban", "hpc_rural"}
 EXISTING_INFRASTRUCTURE_WEIGHT_COLUMN = {
-    "retail": "area",
-    "public_poi": "Weight",
+    "retail": "weight",
+    "public_poi": "weight",
     "hpc_urban": "weight",
     "hpc_rural": "weight",
 }
@@ -56,57 +57,27 @@ LAYER_KEY_TO_USE_CASE = {
     "hpc_rural": "highway_fast",
 }
 
-# Per use case: which data_DE file/layer to load, which columns to keep
-# (weight/attribute columns the corresponding use_case.py function needs,
-# geometry is always kept), and how to rename them onto the schema the
-# existing use_case.py functions expect.
+# Per use case: which data_dir file to load. Every file holds only point
+# geometry and ONE weight column named "weight" (publication format
+# {n}_{use_case}.gpkg, weights scaled to a max of 1, see geodata_minimal) -
+# use_case.py reads that single column for every use case. A column named
+# "Weight" is renamed on load.
 LAYER_CONFIG = {
-    "home_apartment": {
-        "file": "infas_home_apartment_de.gpkg",
-        "keep_columns": ["Haushalte"],
-        "rename": {"Haushalte": "households_total"},
-    },
-    "home_detached": {
-        "file": "infas_home_detached_de.gpkg",
-        "keep_columns": ["Haushalte"],
-        "rename": {"Haushalte": "households_total"},
-    },
-    "work": {
-        # Merged OSM+INFAS candidates (replaced the old INFAS-only file) -
-        # has a real "area" column directly, so work() can use its normal
-        # default weight_column="area" instead of a company-count stand-in.
-        "file": "osm_work_candidates_de.gpkg",
-        "keep_columns": ["category", "office", "area", "source"],
-        "rename": {},
-    },
-    "retail": {
-        "file": "osm_retail_parking_de.gpkg",
-        "keep_columns": ["parking_id", "area", "n_shops", "categories"],
-        "rename": {"categories": "category"},
-    },
-    "depot": {
-        "file": "osm_depot_candidates_de.gpkg",
-        "keep_columns": ["category", "area"],
-        "rename": {},
-    },
-    "public_poi": {
-        "file": "osm_street_parking_de.gpkg",
-        "keep_columns": ["parking_id", "area", "n_pois", "total_weight", "categories"],
-        "rename": {"total_weight": "Weight"},
-    },
-    "hpc_urban": {
-        "file": "osm_hpc_urban_candidates_de.gpkg",
-        "keep_columns": ["category", "area", "weight"],
-        "rename": {},
-    },
-    "hpc_rural": {
-        "file": "osm_bast_hpc_rural_candidates_de.gpkg",
-        "keep_columns": ["highway", "Str_Klasse_kurz", "DTV_Kfz", "weight"],
-        "rename": {},
-    },
+    "home_detached": {"file": "1_home_detached.gpkg"},
+    "home_apartment": {"file": "2_home_apartment.gpkg"},
+    "work": {"file": "3_work.gpkg"},
+    "hpc_urban": {"file": "4a_urban_fast.gpkg"},
+    "hpc_rural": {"file": "4b_highway_fast.gpkg"},
+    "retail": {"file": "5_retail.gpkg"},
+    "public_poi": {"file": "6_street.gpkg"},
+    "depot": {"file": "7_depot.gpkg"},
 }
 
 TARGET_CRS = 3035
+
+# candidate_uid prefix of the residential buildings that public()'s home_street
+# pass places street-parking residents on (they come from the home_apartment layer).
+HOME_STREET_UID_PREFIX = "home_apartment_"
 
 
 def _to_representative_points(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -117,26 +88,12 @@ def _to_representative_points(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return gdf
 
 
-def _finalize_retail_columns(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Synthesize the exact column set use_case.py:retail() expects, so its
-    internal rename-fallback branch (built for the ALKIS/Berlin schema) is
-    skipped entirely for the data_DE schema.
-    """
-    gdf = gdf.copy()
-    gdf["id_0"] = range(len(gdf))
-    gdf["osm_way_id"] = gdf["id_0"]
-    gdf["amenity"] = gdf.get("source", "")
-    gdf["other_tags"] = ""
-    gdf["id"] = gdf["id_0"]
-    return gdf
-
-
 def load_layer(data_dir, layer_key: str) -> gpd.GeoDataFrame:
-    spec = LAYER_CONFIG[layer_key]
-    path = pathlib.Path(data_dir) / spec["file"]
-    gdf = gpd.read_file(path, layer=spec.get("layer"), columns=spec["keep_columns"])
-    if spec["rename"]:
-        gdf = gdf.rename(columns=spec["rename"])
+    path = pathlib.Path(data_dir) / LAYER_CONFIG[layer_key]["file"]
+    gdf = gpd.read_file(path).rename(columns={"Weight": "weight"})
+    if "weight" not in gdf.columns:
+        raise ValueError(f"{path} has no 'weight' column (found: {list(gdf.columns)})")
+    gdf = gdf[["weight", "geometry"]]
     gdf = _to_representative_points(gdf)
     # Deterministic per-candidate identity (layer + row position in the
     # source file), used to recognize "this is the same real-world
@@ -201,6 +158,7 @@ def prepare_candidates(data_dir, prepared_dir, municipalities: gpd.GeoDataFrame,
         )
 
     previous_locations_by_layer = {}
+    previous_home_street = None
     if previous_scenario_dir and (set(layer_keys) - already_prepared):
         utility.safe_print(f"--- loading previous scenario's locations from {previous_scenario_dir} ---")
         # geometry is needed (not just the seeded columns) so a candidate_uid
@@ -215,6 +173,21 @@ def prepare_candidates(data_dir, prepared_dir, municipalities: gpd.GeoDataFrame,
         )
         for layer_key, use_case in LAYER_KEY_TO_USE_CASE.items():
             previous_locations_by_layer[layer_key] = prev_locations[prev_locations["use_case"] == use_case]
+        # use_case "street" holds two kinds of locations: real street POIs
+        # (public_poi_*, bnetza_*, synthetic centres) and the home_street
+        # locations of street-parking residents, which sit on residential
+        # buildings of the home_apartment layer (candidate_uid
+        # "home_apartment_<N>"). The latter must NOT be re-appended to the
+        # public_poi pool as orphaned candidates (non-home events would be
+        # placed on residential buildings, and the same building would turn up
+        # in both populations); they seed public()'s home_street pass via the
+        # home_apartment layer instead (see location_registry.
+        # seed_home_street_columns).
+        street_prev = previous_locations_by_layer.get("public_poi")
+        if street_prev is not None:
+            is_home_street = street_prev["candidate_uid"].astype(str).str.startswith(HOME_STREET_UID_PREFIX)
+            previous_locations_by_layer["public_poi"] = street_prev[~is_home_street]
+            previous_home_street = street_prev[is_home_street]
 
     for layer_key in layer_keys:
         layer_dir = prepared_dir / layer_key
@@ -231,15 +204,32 @@ def prepare_candidates(data_dir, prepared_dir, municipalities: gpd.GeoDataFrame,
             )
         if layer_key in previous_locations_by_layer:
             gdf = lr.merge_previous_scenario_into_candidates(gdf, previous_locations_by_layer[layer_key])
+        if layer_key == "home_apartment" and previous_scenario_dir:
+            gdf = lr.seed_home_street_columns(gdf, previous_home_street)
 
         joined = assign_ags(gdf, municipalities)
 
         df = pd.DataFrame(joined.drop(columns=["geometry"]))
         df["x"] = joined.geometry.x.values
         df["y"] = joined.geometry.y.values
+        # Sorted by Gemeinde (stable: keeps the source row order inside each
+        # one): the writer opens a new file per partition per written batch,
+        # so a spatially unsorted source file (rows of many Gemeinden mixed)
+        # would produce hundreds of thousands of tiny files and hours of
+        # write time instead of about one file per Gemeinde.
+        df = df.sort_values("AGS", kind="stable").reset_index(drop=True)
 
-        layer_dir.mkdir(parents=True, exist_ok=True)
-        df.to_parquet(layer_dir, engine="pyarrow", partition_cols=["AGS"], index=False, max_partitions=12000)
+        # Written to a temp directory and renamed at the end: a crash midway
+        # used to leave a half-written layer dir that the "already prepared"
+        # check above (dir exists and is non-empty) accepted on the next run.
+        tmp_dir = prepared_dir / f"{layer_key}.__writing__"
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(tmp_dir, engine="pyarrow", partition_cols=["AGS"], index=False, max_partitions=12000)
+        if layer_dir.exists():
+            shutil.rmtree(layer_dir)  # only an empty dir can be here (see check above)
+        utility.replace_with_retry(tmp_dir, layer_dir)
         utility.safe_print(f"--- '{layer_key}': {len(df)}/{len(gdf)} candidates matched, written to {layer_dir} ---")
 
 
@@ -247,8 +237,7 @@ def load_candidates(prepared_dir, layer_key: str, ags: str) -> gpd.GeoDataFrame:
     """Read one Gemeinde's candidates for one layer. Empty GeoDataFrame with
     the right columns if this Gemeinde has none for this layer.
     """
-    spec = LAYER_CONFIG[layer_key]
-    attr_columns = [spec["rename"].get(c, c) for c in spec["keep_columns"]]
+    attr_columns = ["weight"]
     partition_dir = pathlib.Path(prepared_dir) / layer_key / f"AGS={ags}"
 
     if not partition_dir.is_dir():
@@ -257,8 +246,5 @@ def load_candidates(prepared_dir, layer_key: str, ags: str) -> gpd.GeoDataFrame:
     df = pd.read_parquet(partition_dir, engine="pyarrow")
     geometry = gpd.points_from_xy(df["x"], df["y"])
     gdf = gpd.GeoDataFrame(df.drop(columns=["x", "y"]), geometry=geometry, crs=TARGET_CRS)
-
-    if layer_key == "retail":
-        gdf = _finalize_retail_columns(gdf)
 
     return gdf.reset_index(drop=True)

@@ -62,14 +62,25 @@ def build_placement_gap_table(normalized_dir: pathlib.Path) -> pd.DataFrame:
     # the difference between reading ~40GB and processing it in ~20M-row
     # slices that get discarded as they go. This is the same class of fix
     # already applied to build_evaluation_report.py's Kennzahlen table.
-    actual_per_event = pd.Series(dtype=np.int64)
+    # np.bincount, not repeated pd.Series.add(fill_value=0) across ~250+
+    # 20M-row batches: that accumulation was observed to raise "cannot
+    # reindex on an axis with duplicate labels" at 2037/2045 scale (works
+    # fine at 2024 scale) - event_id is a dense, non-negative counter
+    # assigned by restructure_output.py, so bincount sums per-batch counts
+    # by plain integer-array indexing with no pandas index-alignment
+    # involved at all, sidestepping whatever accumulates into that bug.
+    max_event_id = int(charging["event_id"].max())
+    actual_counts = np.zeros(max_event_id + 1, dtype=np.int64)
     parquet_file = pq.ParquetFile(normalized_dir / "ev_mapping_event_location.parquet")
     for batch in parquet_file.iter_batches(columns=["event_id"], batch_size=20_000_000):
-        counts = pd.Series(batch.column("event_id").to_numpy(zero_copy_only=False)).value_counts()
-        actual_per_event = actual_per_event.add(counts, fill_value=0)
+        ids = batch.column("event_id").to_numpy(zero_copy_only=False)
+        counts = np.bincount(ids, minlength=actual_counts.size)
+        if counts.size > actual_counts.size:
+            actual_counts.resize(counts.size)
+        actual_counts[:counts.size] += counts
 
     charging["expected"] = draws_per_ev.reindex(charging["ev_id"]).fillna(0).to_numpy().astype(np.int64)
-    charging["actual"] = actual_per_event.reindex(charging["event_id"]).fillna(0).to_numpy().astype(np.int64)
+    charging["actual"] = actual_counts[charging["event_id"].to_numpy()]
     charging["missing"] = charging["expected"] - charging["actual"]
 
     summary = charging.groupby("charging_use_case", dropna=False).agg(
